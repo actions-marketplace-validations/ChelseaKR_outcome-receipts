@@ -129,7 +129,13 @@ repo commits to:
   SLSA-provenanced releases via OIDC Trusted Publishing as the release path
   lands.
 * **CI/CD.** `make verify` reproduces the full AUTO-GATE set byte-for-byte with
-  CI. No admin bypass on `main`.
+  CI. `main` is protected by an active ruleset whose `bypass_actors` holds
+  exactly the repository owner's standing bypass (`RepositoryRole` 5,
+  `bypass_mode: always`), deliberately and permanently: an agent once applied
+  a ruleset with no bypass and locked the owner out of their own repository,
+  and restoring access took a sweep across eighteen repositories. An empty
+  list there is not a stricter gate, it is the lockout, so never "restore"
+  one. See `docs/rulesets/README.md`.
 * **Documentation.** README with a Standards Conformance table (every standard
   marked Applies or N/A-with-reason). MADR-format ADRs in `docs/decisions/`.
   Keep a Changelog. `CITATION.cff`, `SECURITY.md`, `CONTRIBUTING.md`.
@@ -175,11 +181,13 @@ outcome-receipts/
 │   ├── report.py                  # rendering for the report, the receipts manifest, and the eval
 │   ├── suppression.py             # primary, complementary, delta, and percentage disclosure controls
 │   ├── mapping.py                 # deterministic schema mapping and fail-closed review queue
+│   ├── coverage.py                # binds a funder requirement set to an export and refuses an unanswered one
 │   ├── model_draft.py             # optional policy-gated Bedrock prose seam
 │   ├── bundle.py                  # tamper-evident export bundle
 │   ├── ledger.py                  # hash-chained export history
 │   ├── diff.py                    # manifest comparison
 │   ├── scaffold.py                # fail-loud starter spec generation
+│   ├── portfolio.py               # a batch of specs, and the auditor's index over them
 │   ├── cards.py                   # generated model/data cards
 │   └── copy.py                    # EN/ES reviewer-facing strings
 ├── tests/                         # one module per source module, plus grounded-section tests
@@ -187,7 +195,7 @@ outcome-receipts/
 │   ├── test_suppression.py        # MERGE-BLOCKING: no small or recoverable cell survives
 │   └── test_*.py                  # engine, draft, mapping, bundle, ledger, schemas, container, and docs gates
 ├── eval/                          # committed eval report (report.md)
-├── examples/                      # runnable example configs: board-report, grant-report, housing-demo
+├── examples/                      # runnable example configs: board-report, grant-report, housing-demo, multi-funder, requirement-coverage
 ├── docs/
 │   ├── ROADMAP.md
 │   ├── RESEARCH-ROADMAP.md
@@ -220,6 +228,15 @@ Decisions made now so they are not relitigated:
 * **Suppression runs before export, after grounding.** Order: compute → receipt
   → draft → ground → suppress → human-approve → export. Suppression is the last
   transform before a human sees the report, so what they approve is what ships.
+* **Requirement coverage is the other half of the claim, and it gates export.**
+  Grounding asks whether every number in the prose traces to a receipt;
+  coverage asks whether every number the funder required was published. A spec
+  that binds `[requirements]` must account for every requirement as `answered`,
+  `withheld`, or `unanswerable`, or `run` refuses on exit code 4 and writes
+  nothing. An `unanswerable` declaration carries both a blocker `mapping`
+  actually reproduces and a reason a person wrote, because a blocker alone is a
+  tool's excuse and a reason alone is unfalsifiable. A spec with no binding
+  behaves in every byte as it did before. See ADR 0013.
 
 ## Build plan
 

@@ -84,6 +84,11 @@ class MetricSpec:
     ``caveat`` is an optional qualifying note (e.g. a data-quality limitation)
     that travels with the receipt, so a limitation on the figure rides inside the
     receipt chain and renders next to the figure instead of living as loose prose.
+
+    ``requirement_id`` names the requirement in the bound requirement document
+    that this metric answers. It is empty for a metric that answers no declared
+    requirement, and it is the only link between a funder's requirement set and
+    the figures an export publishes. See ``coverage.py`` and ADR 0012.
     """
 
     metric_id: str
@@ -98,6 +103,37 @@ class MetricSpec:
     data_source: str = ""
     collection_frequency: str = ""
     caveat: str = ""
+    requirement_id: str = ""
+
+
+@dataclass(frozen=True)
+class UnanswerableRequirement:
+    """An operator's declaration that a required figure cannot be produced.
+
+    Both halves are mandatory and neither is sufficient alone. ``blocker`` is a
+    machine-readable string that ``mapping.build_mapping_queue`` must actually
+    produce for this requirement against this data -- a blocker the tool does
+    not produce is refused, so the field cannot be used to wave a requirement
+    away. ``reason`` is a sentence a person wrote. A blocker without a reason is
+    a tool's excuse; a reason without a blocker is unfalsifiable.
+    """
+
+    requirement_id: str
+    blocker: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class RequirementsSpec:
+    """The requirement document an export must prove it answered.
+
+    ``path`` is the requirement JSON the spec is bound to -- the same document
+    ``receipts map`` and ``receipts requirements-diff`` read. ``unanswerable``
+    carries the operator's declarations for requirements no metric answers.
+    """
+
+    path: str
+    unanswerable: tuple[UnanswerableRequirement, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -329,6 +365,47 @@ class DraftingSpec:
 
 
 @dataclass(frozen=True)
+class ApprovalPolicy:
+    """The sign-off roles a spec requires before an export may be written.
+
+    ``required`` is the ordered list of role names, as the spec author wrote
+    them. Order is the spec's, not the command line's, so the recorded approvals
+    read the same way whichever order the roles were supplied in.
+
+    A spec that declares no ``[approval]`` section has no policy at all, which is
+    ``None`` rather than an empty ``ApprovalPolicy``. The two are different facts:
+    no policy means the single-approver path applies unchanged, while a policy
+    that required nobody would be a declared gate that cannot fail. The loader
+    refuses the second shape rather than representing it here.
+    """
+
+    required: tuple[str, ...]
+
+    def normalized(self) -> tuple[str, ...]:
+        """The role names as comparison keys, in the spec's own order."""
+
+        return tuple(role_key(role) for role in self.required)
+
+
+def role_key(role: str) -> str:
+    """A comparison key for "is this the same role", never for display."""
+
+    return " ".join(role.casefold().split())
+
+
+def person_key(name: str) -> str:
+    """A comparison key for "is this the same person", never for display.
+
+    Mirrors ``constituent-reconciler``'s ``_reviewer_identity_key``: case and
+    internal whitespace do not make one person into two. A dual sign-off whose
+    two roles can be filled by ``A. Lee`` and ``a.  lee`` is a single signature
+    wearing two names, which is the failure mode that rule exists to stop.
+    """
+
+    return " ".join(name.casefold().split())
+
+
+@dataclass(frozen=True)
 class ReportSpec:
     """A report template plus the metrics it needs.
 
@@ -356,6 +433,8 @@ class ReportSpec:
     reconciliation: ReconciliationSpec | None = None
     templates: tuple[TemplateSpec, ...] = field(default_factory=tuple)
     drafting: DraftingSpec = field(default_factory=DraftingSpec)
+    requirements: RequirementsSpec | None = None
+    approval: ApprovalPolicy | None = None
 
     @property
     def effective_templates(self) -> tuple[TemplateSpec, ...]:
@@ -431,6 +510,86 @@ class SuppressedSpan:
 
 
 @dataclass(frozen=True)
+class SpanCandidate:
+    """One receipted display an unresolved numeric span may have been meant to state.
+
+    A candidate is a *diagnosis*, never a verdict. It is derived from the same
+    canonicalization the gate uses (see ``grounding``), so it can never disagree
+    with the gate about what binds; it says only what the gate found nearby and
+    why the two did not match.
+
+    ``reason`` is the machine-readable class of near-miss and ``detail`` is the
+    sentence a human reads. ``distance`` is the absolute difference between the
+    span's value and the candidate display's value where both resolve to a
+    number, and ``None`` where the near-miss is not a numeric one (a separator
+    ambiguity, a percent stated as a count). It orders candidates within a
+    reason class and nothing else.
+
+    ``substitutable`` is the field ``apply_fixes`` branches on, and it is false
+    for every candidate drawn from the suppressed set. A withheld cell's raw
+    display is a real, receipted string; writing it into the narrative would be
+    the disclosure the gate exists to stop, so a disclosure is offered removal
+    and never a replacement.
+    """
+
+    metric_id: str
+    display: str
+    reason: str
+    detail: str
+    distance: float | None = None
+    substitutable: bool = True
+
+
+@dataclass(frozen=True)
+class Explanation:
+    """Why one numeric span did not bind, and what a human may do about it.
+
+    ``remedy`` is one of four words and each means something different:
+
+    ``replace``  exactly one substitutable candidate is nearest, so a fix plan
+                 may offer its display.
+    ``remove``   the span states a cell the report withholds. Removal is the
+                 only remedy; no substitution is ever offered.
+    ``review``   two or more candidates tie for nearest, so nothing can be
+                 chosen mechanically. ``apply_fixes`` refuses a span in this
+                 state rather than picking one.
+    ``none``     no receipted display is near this number at all. That is not a
+                 failure of the diagnosis; it is the diagnosis, and it says the
+                 number has to be removed or made into a metric.
+
+    ``candidates`` may be empty only when ``remedy`` is ``none``. An explanation
+    with a remedy of ``replace`` and no candidate would be an empty suggestion
+    rendered as a real one, so the invariant is asserted rather than assumed.
+    """
+
+    span: NumericSpan
+    remedy: str
+    detail: str
+    candidates: tuple[SpanCandidate, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.remedy not in ("replace", "remove", "review", "none"):
+            raise ValueError(f"unknown remedy {self.remedy!r}")
+        if self.remedy == "none" and self.candidates:
+            raise ValueError("remedy 'none' cannot carry candidates")
+        if self.remedy != "none" and not self.candidates:
+            raise ValueError(f"remedy {self.remedy!r} requires at least one candidate")
+        if self.remedy == "replace" and not self.candidates[0].substitutable:
+            raise ValueError("remedy 'replace' requires a substitutable candidate")
+
+    @property
+    def replacement(self) -> SpanCandidate | None:
+        """The one display a fix plan may offer, or ``None``.
+
+        Only a ``replace`` remedy has one. ``review`` deliberately returns
+        ``None`` even though it carries candidates: a tie is exactly the case a
+        machine must not resolve.
+        """
+
+        return self.candidates[0] if self.remedy == "replace" else None
+
+
+@dataclass(frozen=True)
 class AuditResult:
     """The outcome of auditing a narrative against the publishable figure set.
 
@@ -445,6 +604,11 @@ class AuditResult:
     bound: tuple[NumericSpan, ...]
     suppressed: tuple[SuppressedSpan, ...]
     unbound: tuple[NumericSpan, ...]
+    #: Diagnoses for the failing spans, empty unless a caller asked for them.
+    #: ``ok`` and ``total`` do not read this field and never will: an
+    #: explanation is advice about a verdict already reached, so adding one
+    #: cannot change the verdict or the exit code derived from it.
+    explanations: tuple[Explanation, ...] = ()
 
     @property
     def ok(self) -> bool:

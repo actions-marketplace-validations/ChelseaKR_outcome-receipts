@@ -40,8 +40,40 @@ rationale and history.
 
 ## Prepare a release
 
-1. Update `pyproject.toml`, `CHANGELOG.md`, and generated cards
-   (`uv run receipts cards --out docs/cards`) in one pull request.
+1. Update **every place that carries the version**, in one pull request. This
+   list is exhaustive as of `0.2.2`, and it is written out because a shorter
+   version of this step is what produced the `0.2.1` drift: the promotion to
+   `0.2.1` moved `CHANGELOG.md` alone, and `pyproject.toml` sat at `0.2.0`
+   through a green `make verify`, a green `ci`, and a `release.yml` whose only
+   version check was satisfied by that tree.
+
+   | File | What moves |
+   |---|---|
+   | `CHANGELOG.md` | `## [Unreleased]` becomes `## [X.Y.Z] - <date>`, and a fresh empty `## [Unreleased]` opens above it |
+   | `CHANGELOG.md` link definitions | the last lines of the file: `[Unreleased]` re-points at `vX.Y.Z...HEAD`, and a new `[X.Y.Z]` compare line is added. Nothing checks these, and `0.2.1`'s promotion had to come back for them |
+   | `pyproject.toml` | `project.version` — this is what `uv build` stamps on the wheel |
+   | `uv.lock` | the `outcome-receipts` editable-root entry's `version`; `make install` runs `uv lock --check`, which fails closed on the drift a bump creates |
+   | `CITATION.cff` | `version` **and** `date-released` |
+   | `README.md` | the status note, and its `Last verified:` stamp |
+   | `docs/cards/` | regenerate: `uv run receipts cards --out docs/cards` |
+
+   Three of those seven are now checked against each other by
+   `make release-version` (`CHANGELOG.md`, `pyproject.toml`, `CITATION.cff`),
+   and `uv.lock` is caught by the `uv lock --check` that `make install` runs.
+   The README prose, the CHANGELOG's link definitions and the cards are not
+   machine-checked and are still read by a person. The date matters and no gate
+   can see it: `make release-version` requires `CITATION.cff`'s `date-released`
+   to equal the CHANGELOG section's date, but both are checked for shape, not
+   for truth, so a release prepared on one day and tagged on another passes
+   green while claiming the wrong date. If the tag is not cut the day the
+   promotion is written, move both.
+
+   **After** the release is published, `action.yml`'s `version` input default
+   and the places `docs/ci-action.md` restates it move to the new tag —
+   separately, because that default names the newest tag a downstream consumer
+   can install, which is not true until the release exists.
+   `scripts/check_conformance.py` already fails when the action's default and
+   the documentation disagree, so they move together or not at all.
 2. Merge only after the complete `make verify` gate passes.
 3. On current `main`, create an SSH-signed annotated tag:
 
@@ -77,3 +109,37 @@ in a new pull request and create a new version tag. If publication partially
 succeeds, rerun only after confirming the tag object is unchanged; the
 workflow replaces GitHub release assets with the same verified bytes, and
 PyPI rejects an already-published filename outright.
+
+## The check that would have caught `v0.2.0`
+
+Step 5 above — confirm the GitHub release, the attestations, the SBOM and the
+PyPI files all correspond — is a person's step, and on 2026-08-16 it was not
+taken. Nothing in the repository noticed for nine days, because the job that
+would have noticed (`verify-published`) was canceled by the same stop that
+canceled the publish it was there to verify.
+
+`.github/workflows/release-reality.yml` asks weekly, from outside the release
+run, and follows a release through **three links** rather than one:
+
+| link | what it reads | how a release stops here |
+|---|---|---|
+| a dated changelog section has a tag | `CHANGELOG.md`, `GET /repos/…/tags` | the section was promoted and the tag was never cut, so a pin written against the version resolves to nothing |
+| a stable tag has a published release | `GET /repos/…/tags`, `GET /repos/…/releases` | the tag was pushed and the dispatch in step 4 never ran — pushing a tag alone starts nothing |
+| a published release is on the index | `GET /repos/…/releases`, `https://pypi.org/simple/outcome-receipts/` | the dispatch ran and `pypi-publish` was never approved: **this is `v0.2.0`** |
+
+It needs nothing from the run that published, so it cannot share that run's
+failure mode. `scripts/check_release_reality.py` decides, prints both numbers
+for every link, and has three answers rather than two — a document it could
+not read is **unmeasurable** and exits 2, which is neither a pass nor a
+finding.
+
+Two things it deliberately does not do. It does not read a release's
+**assets**: a release with none is not a failed release, two repositories in
+this portfolio publish source-only releases on purpose, and what is being
+followed is the version. And it does not read
+`https://pypi.org/project/<name>/`, which answers an automated caller with
+HTTP 200 and a bot-detection page; the simple API returns 404 for a
+distribution that is absent, which is an answer.
+
+It will stay red until every link holds. That is the state it exists to
+report, not a defect in the commit it runs against.

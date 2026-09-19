@@ -52,6 +52,12 @@ reconstructs that manifest's rendering from the current figures before
 comparing, so the schema change is not reported as data drift and the frozen
 `v0.1.0` baseline still re-derives. Nothing writes `1.0` any more.
 
+`receipts verify` also reports a warning, never a failure, for each `1.0`
+receipt that displays `[SUPPRESSED]` while carrying a number in `value`,
+`row_count`, or `slice_hash`. Re-deriving those placeholders proves they still
+hold, not that a reader can tell them from a true zero. The warning leaves `ok`
+and the exit code as they were, and `--json` lists it under `warnings`.
+
 The workflow artifact version is unchanged at `1.0`. Its envelope did not
 change; what changed is inside the receipts it embeds, and those are governed by
 the receipts-manifest contract. `receipts verify-workflow` gained a check that
@@ -98,8 +104,9 @@ Before a release can claim a stable contract:
 The repository freezes generated version-1.0 examples for all six workflow
 artifact kinds under `tests/fixtures/compat/v1/` and regenerates them in
 `make verify` to catch drift. Cross-release execution evidence is tracked in
-[issue 65](https://github.com/ChelseaKR/outcome-receipts/issues/65) and begins
-with the next two tags; it cannot be manufactured from a single release.
+[issue 65](https://github.com/ChelseaKR/outcome-receipts/issues/65). Two tags now
+exist, `v0.1.0` and `v0.2.0`, and both are frozen and exercised; what they do not
+yet establish is stated under the matrix below rather than left as "pending".
 
 ## Compatibility evidence
 
@@ -108,10 +115,146 @@ with the next two tags; it cannot be manufactured from a single release.
 | Signed `v0.1.0` tag, commit `51d18fc4cdd9f9dcd91dd4588ededc80a6b6bb7d` | Unversioned beta report spec, interpreted as report-spec `1.0` | Current loader | PASS |
 | Signed `v0.1.0` tag, same commit | Receipts manifest `1.0` | Current re-derivation verifier (reads `1.0`, writes `2.0`) | PASS |
 | Current implementation package | Workflow artifact `1.0`, all six kinds | `receipts verify-workflow` | PASS |
-| Next tagged release | All supported contracts | Next tagged verifier | Pending issue 65 |
+| Signed `v0.2.0` tag, commit `b8f5a27e48283e6b97add1841d1f8a110f760265` | Report spec `1.0`, declared explicitly | Current loader | PASS |
+| Signed `v0.2.0` tag, same commit | Receipts manifest `1.0` | Current re-derivation verifier (reads `1.0`, writes `2.0`) | PASS |
+| Signed `v0.1.0` tag, manifest relabeled `schema_version: "3.0"` | A manifest major nothing implements | Current re-derivation verifier | REFUSED by name; every receipt in it still re-derives, so the refusal is the declared version and nothing else |
+| Signed `v0.1.0` tag, manifest with one figure edited by hand | Receipts manifest `1.0`, altered after release | Current re-derivation verifier | REFUSED as drift, on the edited metric by name |
+| Signed `v0.2.0` tag, spec relabeled `schema_version: "2.0"` | A report-spec major nothing implements | Current loader | REFUSED before computation; no output written |
+| Next tagged release | A contract that actually moves across the boundary | Next tagged verifier | Not yet observed — see below |
 
 The signed-release files are preserved byte-for-byte under
-`tests/fixtures/compat/v0.1.0/`; the source commit and paths are recorded in that
-directory. `tests/test_release_compatibility.py` recomputes the tagged manifest
-with current code. This establishes a real prior-release baseline, but the v1
-gate still needs evidence across the next two consecutive tags.
+`tests/fixtures/compat/v0.1.0/` and `tests/fixtures/compat/v0.2.0/`; each
+directory records its source commit and paths. `tests/test_release_compatibility.py`
+recomputes each tagged manifest with current code.
+
+The last three rows are the same released artifacts with one field changed, and
+they are in the table for a reason a PASS row cannot supply on its own. A
+verifier that accepts every document also accepts a released one, so "the
+`v0.1.0` manifest re-derives" is only evidence if some neighboring document does
+not. Each refusal names what it refused: the relabeled manifest fails on
+`schema_version` while all four of its receipts still re-derive, so the failure
+is attributable to the declared version rather than to the data; the edited
+manifest fails on the single metric whose figure moved; and the relabeled spec
+is refused by the loader before any figure is computed, which is asserted by
+pointing that spec's `[data] path` at a CSV that does not exist — if refusal ever
+moved to after the read, the missing file would raise first and the test would
+say so. The refused run leaves its `--out` directory empty. A half-written bundle
+from a rejected spec would be a receipt set with nothing behind it.
+
+What the second tag established, and what it did not. `v0.2.0`'s
+`services.csv` and `receipts.json` are byte-identical to `v0.1.0`'s: the second
+released implementation produced exactly the artifact the first one did. The only
+difference between the two frozen specs is that `v0.2.0`'s declares
+`schema_version = "1.0"` where `v0.1.0`'s carried no `schema_version` key and was
+interpreted as `1.0` by default. So the evidence across this boundary is real but
+narrow — a spec that names its contract and a spec that omits it are read
+identically, and a released implementation's manifest still re-derives
+field-for-field.
+
+It is not evidence that a *changed* contract survives a release boundary, because
+no contract changed across it. That is what issue 65's remaining criteria need,
+and it cannot be written before a release moves one; recording the gap here is
+the honest alternative to reading two identical artifacts as a compatibility
+result.
+
+## Report spec 1.0: `[requirements]` is an additive, optional binding
+
+The reasoning is recorded in
+[ADR 0013](decisions/0013-requirement-coverage-is-proven-at-export.md).
+
+`[requirements] path = "..."` binds a spec to a funder's requirement document,
+and each metric may carry `requirement_id`. Both are optional at spec `1.0`, in
+exactly the way `[[data_checks]]` is: a spec that declares neither loads,
+computes, grounds, approves, and exports precisely what it did before, and the
+version does not move.
+
+The receipts manifest stays at `2.0` and gains one optional member,
+`requirements`, present only for a bound spec. Three things follow, and the
+third is a real limitation rather than a footnote:
+
+- **A manifest from an unbound spec is byte-identical to what it was.** The key
+  is absent, not an empty record — such a spec has not answered zero
+  requirements, it has made no coverage claim at all. `verify --bundle` reports
+  `not checked` rather than `ok` for the same reason.
+- **A `2.0` consumer that ignores unknown members reads a bound manifest
+  unchanged.** The coverage record is beside the receipts, never inside one, so
+  nothing a `2.0` reader already parses has moved.
+- **A consumer validating against a copy of the `2.0` schema taken before this
+  change will reject a bound manifest**, because that schema sets
+  `additionalProperties: false`. The published schema now describes
+  `requirements`; a pinned older copy does not. The alternative — a `2.1` —
+  would have moved the version on every manifest including those from unbound
+  specs, breaking the byte-identity above for every consumer in order to
+  describe a member none of them would receive. That trade was chosen this way
+  deliberately and is the one thing here worth revisiting if a real consumer
+  turns out to validate against a pinned copy.
+
+`verify --bundle` re-derives the coverage record and the requirement document's
+sha256 rather than reading either back from the manifest, so editing the
+requirement document after export fails naming the digest, and editing the
+coverage record itself fails as a mismatch against what the spec and data
+actually produce.
+
+## Report spec 1.0: `[approval]` is an additive, optional sign-off policy
+
+`[approval] required = ["program", "finance"]` names the roles an export must
+record before it may be written. It is optional at spec `1.0`, in exactly the
+way `[requirements]` and `[[data_checks]]` are: a spec that omits the section
+loads, computes, grounds, approves and exports precisely what it did before, and
+the version does not move.
+
+One shape is refused rather than accepted as a policy. An `[approval]` table
+that names no role would be a declared sign-off gate that demands nobody, and it
+would read in the manifest exactly like a satisfied one. The loader rejects it
+naming the key. Absent means "no policy"; present means "these roles".
+
+The receipts manifest stays at `2.0` and its `provenance` block gains one
+optional member, `approvals`, present only for a spec that declares a policy.
+Each entry carries `role`, `approved_by` and `approved_at`. Three consequences:
+
+- **A manifest from a spec with no policy is byte-identical to what it was.**
+  The key is absent, not an empty list. Such a spec has not satisfied zero
+  roles, it has declared none, and `verify --bundle` reports `not checked`
+  rather than `ok` for the same reason it does for an unbound requirement set.
+- **`approved_by` keeps naming a person and is not replaced.** For a role-based
+  export it carries every approver, in the policy's order, as
+  `A. Lee (program), B. Cruz (finance)`. Everything that already reads it —
+  `verify-workflow`, the rollup composition's "bundle has no named human
+  approval" refusal, the provenance paragraph in the report body — keeps working
+  without learning a new field, and reads a complete answer rather than one of
+  two names.
+- **A consumer validating against a pinned older copy of the `2.0` schema still
+  accepts a manifest carrying approvals.** `provenance` is declared with
+  `additionalProperties: true`, so this addition costs nothing that the
+  `requirements` member cost. That is the difference between adding a member
+  inside an open object and adding one beside a closed one.
+
+`verify --bundle` reads the policy from the spec, never from the manifest. Both
+directions fail. A manifest recording no approvals against a spec that requires
+them was exported before the policy existed, so its report proves nothing about
+the policy now in force. A manifest recording approvals against a spec that
+declares none records a gate nothing now defines. A manifest whose `approvals`
+member is present but unreadable fails the comparison rather than taking the
+"nothing to compare" path, because that path reports `not checked` and passes.
+
+The policy governs the evidence-workflow commands that run from one spec —
+`restate`, `contract-check` and `equity-review` — for the reason the section
+exists: a requirement that travels with the report definition must not be
+satisfiable by a different invocation. `migrate-check` and `rollup` are not
+covered. `migrate-check` reads two specs and there is no settled answer to which
+one's policy governs a comparison between them; `rollup` reads a plan rather
+than a spec and has no policy to read. Both still take `--approved-by`.
+
+## Receipts manifest 2.0: `artifacts` may name `report.docx`
+
+`run --format docx` records `report.docx` in `artifacts` beside `report.md`,
+`trace.html` and each chart. This is **compatible** and needs no version change:
+`artifacts` was already a map from any bundle-relative path to a digest, so a
+consumer validating against the published `2.0` schema accepts it, and a run
+without the flag writes the map exactly as before.
+
+What an older verifier does with it is worth stating, because it is less than
+the current one. A verifier from before this change checks the document's
+sha256 like any other artifact and stops there: it does not read the document,
+compare it with `report.md`, or ground its narrative. The current verifier does
+all three, and it also fails a `report.docx` the manifest does not attest.

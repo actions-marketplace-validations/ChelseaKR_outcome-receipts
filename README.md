@@ -6,6 +6,10 @@
 
 ![Outcome Receipts: deterministic SQL to receipt to grounding gate to verified report](docs/assets/social-preview.png)
 
+**New here?** [Run the five-minute demo](docs/TRY_THE_DEMO.md). It uses
+synthetic data, makes no network calls, and ends with the grounding gate
+refusing an invented number.
+
 Draft funder outcome reports where **every reported figure is a receipt**. The
 tool reads a nonprofit's own service data, computes each required figure with a
 deterministic query, and attaches to that figure a receipt: the exact query, the
@@ -22,8 +26,15 @@ query, and those are receipt metadata rather than reported figures. Running the
 gate over a whole exported `report.md` reports them as unbound, which is the
 scope working as specified and not a gate failure.
 
-> **Status: Beta.** The current tagged release is `v0.2.0`; `v0.1.0` was the
-> first. The default path is
+> **Status: Beta.** This tree declares `0.2.2`, prepared for release and not
+> yet tagged. The two versions before it stopped in different places and are
+> worth keeping apart: `v0.2.0` is a published GitHub release whose PyPI upload
+> was never approved, and `v0.2.1` is a signed tag with no release at all —
+> the commit it names still declares `0.2.0`, so it was never coherent, and it
+> is left in place rather than moved. The newest version installable from PyPI
+> is therefore `0.1.0`; the newest GitHub release is `v0.2.0`. What remains is
+> the maintainer's alone and is recorded in
+> [docs/RELEASING.md](docs/RELEASING.md). The default path is
 > deterministic, offline, and tested end to end. The release includes the completed privacy,
 > verification, mapping, localization, multi-template, reconciliation, and
 > optional Bedrock-drafting roadmap work. The v1 implementation package adds
@@ -35,7 +46,7 @@ scope working as specified and not a gate failure.
 > See [CHANGELOG.md](CHANGELOG.md) and
 > [SECURITY.md](SECURITY.md#supported-versions).
 >
-> *Last verified: 2026-07-22 · Recheck cadence: quarterly*
+> *Last verified: 2026-09-13 · Recheck cadence: quarterly*
 
 **Start here:** [run the five-minute synthetic demo](docs/TRY_THE_DEMO.md),
 [inspect the current evaluation](eval/report.md), or
@@ -170,6 +181,21 @@ It writes `out/report.md` (the narrative, provenance, and receipts appendix),
 export). Runs also append to `export-ledger.jsonl` by default. Specs with charts
 add accessible SVG files under `out/charts/`.
 
+Funder portals that want Word get it from the same run: `--format docx` also
+writes `out/report.docx`, rendered from `report.md` and gated again on the
+document's own bytes. It has to say what `report.md` says and its narrative has
+to ground, or the run writes nothing and exits 2; `receipts verify --bundle`
+holds it to the same check later. Charts appear as their data tables, with a
+sentence naming the SVG in the export. See
+[ADR 0014](docs/decisions/0014-the-word-export-is-gated-on-its-own-bytes.md).
+
+A spec may also bind the funder's requirement document. Then the export must
+account for every requirement in it — answered by a metric, withheld because
+small-cell suppression hid the cell, or declared unanswerable with a blocker
+`receipts map` actually reproduces and a reason a person wrote — or it names the
+requirement, writes nothing, and exits 4. See
+[Proving the report answered the requirement set](#proving-the-report-answered-the-requirement-set).
+
 An export also needs a named human sign-off. `--approved-by NAME` records the
 approver non-interactively; without it, an interactive run prompts you to type
 your name after the grounding gate passes, and a non-interactive run aborts with
@@ -177,6 +203,36 @@ exit code 3 and writes nothing. The approver and the approval time are recorded
 in the provenance statement of the report and in the receipts manifest
 (`provenance.approved_by`, `provenance.approved_at`; `approved_by` is `null`
 when nothing was approved, which no export should ever carry).
+
+#### Requiring more than one signature
+
+Boards and contracts often require two people, a program lead and a finance
+lead. A spec can say so, and then the requirement travels with the report
+definition rather than with the flag whoever ran the export happened to type:
+
+```toml
+[approval]
+required = ["program", "finance"]
+```
+
+```
+receipts run --config report.toml --out out \
+  --approve program:"A. Lee" --approve finance:"B. Cruz"
+```
+
+A run missing a required role writes nothing and exits 3 naming the role. The
+same person cannot fill two roles; the comparison folds case and internal
+whitespace, so `A. Lee` and `a.  lee` are one person. `--approved-by` is refused
+against a role policy, because a policy a different flag can satisfy is not a
+policy. An interactive run prompts once per unfilled role.
+
+Each approval is recorded in the manifest under `provenance.approvals` with its
+role, approver and timestamp, and `provenance.approved_by` names every approver
+so a reader that only knows that field still reads a complete answer.
+`receipts verify --bundle` re-reads the policy from the spec, so a bundle stops
+verifying if the policy later gains a role or an approval is edited out of the
+manifest. `restate`, `contract-check` and `equity-review` honor the same
+policy. A spec with no `[approval]` section behaves exactly as it did before.
 
 ### Minimal report specification
 
@@ -251,6 +307,46 @@ reports two distinct failures, and exits non-zero on either:
   trace to a real receipt, which is exactly why grounding against the raw figures
   used to pass it. Writing it into a report publishes a protected count, so
   `audit` names the metric it discloses rather than calling it unbound.
+
+A sentence carrying no numeral is invisible to all of that, so `audit` and `run`
+also check the narrative's **comparative claims** against the directions the
+comparison actually computed. "Placements rose" binds only when some declared
+comparison row's own `direction` is an increase; a claim every row contradicts is
+refused and named beside what the receipts say; a claim that agrees only with a row
+suppression withheld is reported as a disclosure, because writing it publishes a
+direction the comparison table itself redacts. Four families are detected and can
+never bind, for the reason a written-out numeral never binds: an evaluative word
+("improved") needs a metric polarity no spec declares, a magnitude word ("doubled")
+needs a ratio nothing here computes, a quantifier ("most") needs a proportion of a
+total no figure states, and a superlative ("highest") needs a ranking the tool does
+not model. See
+[ADR 0012](docs/decisions/0012-comparative-claims-bind-to-receipted-directions.md),
+which also records what it deliberately leaves open.
+
+`--explain` says *why* each of those numbers missed: which receipted displays are
+nearest and by how much, whether the miss is a rounding, a magnitude slip, a
+percentage written as a count, or the thousands/decimal ambiguity
+[ADR 0011](docs/decisions/0011-canonicalization-preserves-magnitude.md)
+deliberately refuses to resolve. It is advice; the verdict and the exit code are
+the same with and without it, and `run --explain` likewise explains a refusal
+without softening it.
+
+`--fixes-out` writes that diagnosis as a reviewable JSON plan, and
+`--apply-fixes` applies a plan you have read, to a new file:
+
+```sh
+receipts audit --config report.toml --narrative draft.md --fixes-out fixes.json
+receipts audit --config report.toml --narrative draft.md \
+  --apply-fixes fixes.json --fixed-out draft.fixed.md
+```
+
+The applier substitutes only exact receipted displays, re-checked against the
+figure set at the moment it runs, and then re-runs the gate over the bytes it
+wrote. It refuses the plan whole — never in part — if the narrative has changed
+since the plan was built, if a replacement is not the current display of a
+publishable figure, or if a replacement would state a suppressed cell. A span two
+displays are equally near gets no fix at all: nothing in the text says which, so
+nothing is chosen for you.
 
 `run` refuses to export in either case.
 
@@ -409,7 +505,8 @@ pinning guidance.
 | `receipts init` | Inspect a CSV header and create an empty, fail-loud starter spec. |
 | `receipts map` | Map explicit funder requirements to candidate SQL and emit a mandatory human review queue; see [metric mapping](docs/metric-mapping.md). |
 | `receipts run` | Compute, ground, suppress, approve, export, seal, and append to the ledger. |
-| `receipts audit` | Check an existing narrative against the publishable figures: report spans that bind to no receipt, and spans that state a suppressed cell. |
+| `receipts audit` | Check an existing narrative against the publishable figures: report spans that bind to no receipt, and spans that state a suppressed cell. `--explain` diagnoses each miss; `--fixes-out` / `--apply-fixes` round-trip a reviewable fix plan. |
+| `receipts mcp` | Serve `audit`, `verify`, `trace` and the publishable figure list to a drafting tool over stdio, read-only. No export tool, no approval tool, no network, no new dependency; a withheld cell answers as the redaction marker. See [drafting](docs/drafting.md). |
 | `receipts eval` | Score grounding behavior on a configured fixture. |
 | `receipts verify` | Recompute receipt values and hashes, or verify an entire exported bundle with `--bundle`. |
 | `receipts verify-bundle` | Recompute `bundle.json` member digests and an optional keyed signature. |
@@ -419,9 +516,12 @@ pinning guidance.
 | `receipts migrate-check` | Compare reviewed metrics across two schema-variant exports. Each metric is `equivalent`, `changed`, or `indeterminate` (withheld by suppression on one side, so no comparison is possible). |
 | `receipts requirements-diff` | Classify funder requirement changes by stable ID and text digest. |
 | `receipts contract-check` | Package receipted milestone, threshold, and financial evidence without making a legal determination. |
+| `receipts suppress-preview` | Preview what one or more suppression policies would withhold from a report, before anything is exported. Writes nothing. The shareable output never prints a withheld value; `--local` opts into them. |
 | `receipts rollup` | Compose an aggregate count from verified, unsuppressed partner bundles. |
 | `receipts equity-review` | Package allowlisted subgroup receipts after whole-report suppression, with required policy and consent context. |
 | `receipts verify-workflow` | Validate an evidence artifact's schema version, typed relationship, digests, aggregate-only boundary, and composed-receipt lineage. |
+| `receipts portfolio` | Export several report specs as one batch through the ordinary gate, into one directory and one shared ledger. The first spec that fails stops the batch and no portfolio record is written. |
+| `receipts portfolio-verify` | Re-verify every bundle in a portfolio from its own spec and render `index.html`: per report the gate result, who signed off, the bundle digest and its ledger entry, plus the figures more than one report states. |
 | `receipts cards` | Generate or drift-check the model and data cards. |
 
 Run `receipts <command> --help` for the complete option reference. Every command
@@ -453,6 +553,14 @@ recorded approval. Under `--json` there is no interactive sign-off prompt, so
 `verify-ledger`, `eval`, `diff`, and `cards` objects report their own results and
 details; `map` reports pending or blocked candidates without executing them;
 `init` carries the scaffolded spec and where it was written.
+
+`verify` reports its counts twice over, because two different things are checked
+and only one of them is a receipt. `receipts_checked`, `receipts_ok` and
+`receipts_drift` count receipts re-derived from the data. `n_ok` and `drift` are
+totals that also include the manifest's own descriptors — its declared
+`schema_version` and its `hash` block — which are compared against a constant and
+re-derived from nothing. Each entry in `checks` carries a `kind` of `receipt` or
+`manifest` saying which it is, so a script need not guess from the `metric_id`.
 `verify-workflow` reports every artifact-contract check, and each workflow
 command returns the artifact it wrote. The `--json` flag is accepted before or
 after the subcommand, so `receipts --json run ...` and `receipts run ... --json`
@@ -466,7 +574,103 @@ and JSON forms.
 | 0 | Success. The command ran and the grounding gate, where one applies, passed. |
 | 1 | A check failed closed: mapping was blocked, grounding/eval failed, receipts or a bundle drifted, a ledger chain broke, or generated cards were stale. |
 | 2 | The grounding gate refused to export. `run` found an unbound number and wrote nothing. |
-| 3 | The export was not approved. The grounding gate passed but no named human signed off (no `--approved-by`, and no interactive sign-off), so `run` wrote nothing. |
+| 3 | The export was not approved. The grounding gate passed but no named human signed off (no `--approved-by`, and no interactive sign-off), or the sign-off did not satisfy the spec's `[approval]` policy, so `run` wrote nothing. |
+| 4 | The export did not answer its bound requirement set. A requirement was neither answered by a metric, withheld as a suppressed cell, nor declared unanswerable with a blocker `map` reproduces and a reason a person wrote — so `run` named it and wrote nothing. Only a spec with a `[requirements]` binding can return this. |
+
+### Publishing more than one report
+
+An organization rarely publishes one report. It publishes a grant report, a
+board report, and a template per funder, each from its own spec. The receipts
+prove every figure in each one and prove nothing about the set, and an auditor
+holding five output directories has no page saying which reports exist, which
+still verify, and whether two of them state the same metric differently.
+
+```sh
+receipts portfolio \
+  --specs examples/grant-report/report.toml examples/board-report/report.toml \
+  --out out/portfolio --approved-by "A. Reviewer"
+receipts portfolio-verify --dir out/portfolio
+```
+
+The batch takes no shortcut: each spec is exported by `run` itself, so the
+grounding gate, the requirement-coverage refusal, suppression and the human
+sign-off apply exactly as they do to a single report, and a spec's `[approval]`
+policy applies too. Every export appends to one shared ledger. The first spec
+that fails stops the batch, names itself, and returns its own exit code, and no
+portfolio record is written. Specs run in path order, so the batch is the same
+whichever order the arguments arrived in.
+
+`portfolio-verify` re-verifies every bundle from its own spec and writes
+`index.html`: per report the gate result, who signed off, the bundle signature
+and digest, and the ledger entry, followed by the figures more than one report
+states. That table computes nothing. It compares what each report already
+published, and it keeps four outcomes apart:
+
+| Outcome | What it means |
+| --- | --- |
+| Same definition, same value | The reports agree. |
+| Same definition, different values | The reports contradict each other. This is the only one of the four that says so. |
+| Definitions differ | The reports count different things, so their values are not comparable at all and no comparison was made. |
+| Withheld in at least one report | Small-cell suppression withheld the cell. An absence, never a disagreement and never a zero. |
+
+The index is one static, script-free HTML file in EN or ES, held to the same
+WCAG 2.2 AA gate as the trace view.
+
+### Proving the report answered the requirement set
+
+The project proves every published number traces to a receipt. That is one half
+of the claim. The other is that every *required* number was published, and it is
+the half an auditor checks first: a spec that simply omitted a required metric
+used to run, ground, be approved, and export a report that was fully receipted
+and silently incomplete.
+
+Bind the spec to the requirement document `receipts map` already reads, and name
+the requirement each metric answers:
+
+```toml
+[requirements]
+path = "requirements.json"
+
+[[requirements.unanswerable]]
+requirement_id = "R-4"
+blocker = "no source column matches logical field 'return_within_180_days'"
+reason = "The HMIS export carries no re-entry field. Returns are tracked in the continuum's separate quarterly reconciliation."
+
+[metrics.clients_served]
+requirement_id = "R-1"
+# ...
+```
+
+Every requirement then lands in one of four states, and only three of them may
+be exported:
+
+| status | meaning |
+| ------ | ------- |
+| `answered` | a metric names it and its figure was published with a receipt |
+| `withheld` | a metric names it, the figure exists, and suppression withheld the cell — **answered**, and it reads as unanswered nowhere |
+| `unanswerable` | no metric answers it, and the spec carries both a blocker and a reason |
+| `unanswered` | anything else: the export is refused, exit 4, nothing written |
+
+An `unanswerable` declaration needs **both** halves and neither is enough alone.
+A blocker without a reason is a tool's excuse; a reason without a blocker is
+unfalsifiable. So the declared `blocker` is re-derived at export by running the
+mapper over the same data and the same requirement document, and the declaration
+is refused unless the mapper produces that exact string. A requirement that maps
+cleanly cannot be declared unanswerable at all.
+
+The coverage table renders in the report appendix in both locales, the
+requirement document's sha256 rides in `receipts.json`, and `verify --bundle`
+re-derives both — so editing the requirement document after export fails naming
+the digest, and doctoring the coverage record fails as a mismatch. A spec with no
+`[requirements]` binding is unchanged in every byte and its manifest carries no
+coverage key at all; `verify --bundle` says `not checked`, not `ok`.
+
+```sh
+receipts run --config examples/requirement-coverage/report.toml --out out --approved-by "Program director"
+```
+
+See [ADR 0013](docs/decisions/0013-requirement-coverage-is-proven-at-export.md)
+for the reasoning and for the one question it deliberately leaves to the owner.
 
 ## What it does not do
 
@@ -500,7 +704,7 @@ project-specific values live in [docs/ROADMAP.md](docs/ROADMAP.md) and
 | Incident Response | Applies — severity/label convention, private disclosure, secret-leak runbook, and committed-postmortem requirement |
 | Data Governance | Applies — L3 ephemeral input and L2 aggregate-output cards, retention boundary, lineage, and verified recovery procedure |
 | Performance | Applies — Lighthouse performance score and a zero-byte script budget on the generated trace, asserted from the one repository Lighthouse config, plus a committed `perf/baseline.json` and a direction-aware 10% regression gate (`make perf`); k6 latency is N/A with reason, there being no hosted route, and the reason is recorded in [perf/README.md](perf/README.md) rather than skipped |
-| AI-Development Measurement | Applies — no measurement artifact is committed in this repository yet; recorded here as an open gap, not as an exemption |
+| AI-Development Measurement | Applies — declared in the [ROADMAP](docs/ROADMAP.md) metrics ledger, with the delivery and quality-debt metrics recorded as dated BASELINE rows that each name the date their graduation decision is due; diagnostic counters are tracked nowhere and gate nothing. The portfolio-level weekly rollup and the quarterly seven-capability self-assessment are named as outstanding in the same section rather than claimed |
 
 ## License
 
@@ -517,5 +721,5 @@ Never post client-level rows, identifiers, credentials, or real service exports.
 ## Support
 
 This is independent work, published so it can be read and checked rather than taken on
-trust. If your organization wants help making its outcome reporting traceable, see
-[consulting and workshops](https://chelseakr.com/consulting/).
+trust. If your organization wants help making its outcome reporting traceable,
+[get in touch](https://chelseakr.com/contact).

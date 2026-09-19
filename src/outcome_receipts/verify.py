@@ -17,22 +17,36 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+from outcome_receipts.coverage import RequirementCoverage
+from outcome_receipts.docx import (
+    DOCX_NAME,
+    Block,
+    DocxError,
+    DocxText,
+    document_blocks,
+    document_title,
+    read_docx,
+)
 from outcome_receipts.grounding import ground
 from outcome_receipts.models import (
     EMPTY_SLICE_HASH,
     HASH_ALGORITHM,
     HASH_CANONICALIZATION,
     HASH_DIGEST_SIZE,
+    REDACTED_DISPLAY,
     SCHEMA_VERSION,
     SUPPORTED_SCHEMA_VERSIONS,
+    ApprovalPolicy,
     Figure,
     GroundingResult,
 )
+from outcome_receipts.provenance import ApprovalError, resolve_approvals
 
 # The receipt fields re-derivation compares. ``computed_at`` is excluded on
 # purpose; see the module docstring.
@@ -53,20 +67,58 @@ _CHECKED_FIELDS = (
 _CHECKED_FIELDS_V1 = tuple(field for field in _CHECKED_FIELDS if field != "suppressed")
 
 
+#: What a :class:`Check` is about. ``"receipt"`` is one receipt re-derived from
+#: the data. ``"manifest"`` is a descriptor of the document itself -- its declared
+#: schema version, its hash descriptor -- which is compared against a constant and
+#: is not re-derived from anything.
+#:
+#: The distinction used to go unrecorded, and everything downstream inherited the
+#: conflation: a four-receipt manifest was reported as "receipts checked: 6
+#: (re-derived 6)", and a manifest whose only failure was its declared version was
+#: announced as "a receipt does not match the data" with ``drift 1`` pointing the
+#: reader at data that was fine.
+CheckKind = Literal["receipt", "manifest"]
+
+
 @dataclass(frozen=True)
 class Check:
-    """The verification outcome for one receipt in the manifest."""
+    """The verification outcome for one check against the manifest.
+
+    ``metric_id`` names a metric when ``kind`` is ``"receipt"``, and names the
+    descriptor (``schema_version``, ``hash``) when ``kind`` is ``"manifest"``.
+    """
 
     metric_id: str
     ok: bool
+    detail: str
+    kind: CheckKind = "receipt"
+
+
+@dataclass(frozen=True)
+class VerifyWarning:
+    """Something verify reports about one receipt without failing on it.
+
+    A warning never enters :attr:`VerifyResult.ok`, so it never changes the exit
+    code of ``receipts verify`` or of the reusable action that runs it.
+    """
+
+    metric_id: str
     detail: str
 
 
 @dataclass(frozen=True)
 class VerifyResult:
-    """Every per-receipt check, plus whether the manifest verified as a whole."""
+    """Every check run against the manifest, and whether it verified as a whole.
+
+    ``checks`` holds both kinds in report order, manifest descriptors first.
+    ``n_ok`` counts all of them; the receipt-only counts are the ones to quote as
+    "how many receipts re-derived", because they are the only ones that did.
+    """
 
     checks: tuple[Check, ...]
+    #: Reported beside the checks and never failed on: ``ok`` reads ``checks``
+    #: alone. See ``_legacy_withheld_warnings``.
+    warnings: tuple[VerifyWarning, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -74,7 +126,35 @@ class VerifyResult:
 
     @property
     def n_ok(self) -> int:
+        """Every passing check, of both kinds. Not a count of receipts."""
+
         return sum(1 for check in self.checks if check.ok)
+
+    @property
+    def receipt_checks(self) -> tuple[Check, ...]:
+        """The checks that re-derived a receipt from the data."""
+
+        return tuple(check for check in self.checks if check.kind == "receipt")
+
+    @property
+    def manifest_checks(self) -> tuple[Check, ...]:
+        """The checks against the manifest document's own descriptors."""
+
+        return tuple(check for check in self.checks if check.kind == "manifest")
+
+    @property
+    def n_receipts_ok(self) -> int:
+        """How many receipts re-derived. This is the number to report as such."""
+
+        return sum(1 for check in self.receipt_checks if check.ok)
+
+    @property
+    def failed_receipts(self) -> tuple[Check, ...]:
+        return tuple(check for check in self.receipt_checks if not check.ok)
+
+    @property
+    def failed_manifest_checks(self) -> tuple[Check, ...]:
+        return tuple(check for check in self.manifest_checks if not check.ok)
 
 
 def _recomputed_fields(figure: Figure, *, legacy: bool) -> dict[str, Any]:
@@ -109,12 +189,16 @@ def _recomputed_fields(figure: Figure, *, legacy: bool) -> dict[str, Any]:
 def _schema_checks(manifest: Mapping[str, Any]) -> list[Check]:
     """Version and hash-descriptor checks against the current constants.
 
-    Run before any field re-derivation so a manifest written under a different
-    schema fails with a named reason ("schema_version: manifest '0.9' != expected
-    '1.0'") rather than as a wave of opaque per-receipt slice-hash drift. Each
-    descriptor is checked only when the manifest carries it, so a pre-schema
-    manifest (no ``schema_version``, no ``hash``) is not flagged here and falls
-    through to plain re-derivation.
+    Reported first, so a manifest written under a different schema names its
+    reason ("schema_version: manifest '0.9' is not one of ['1.0', '2.0']") at the
+    top rather than leaving a reader to infer it from a wave of opaque
+    per-receipt slice-hash drift below. Each descriptor is checked only when the
+    manifest carries it, so a pre-schema manifest (no ``schema_version``, no
+    ``hash``) is not flagged here and falls through to plain re-derivation.
+
+    These are ``kind="manifest"`` checks: they are compared against a constant,
+    not re-derived from the data, and counting them among the re-derived receipts
+    overstated every verification by the number of descriptors present.
     """
 
     checks: list[Check] = []
@@ -131,7 +215,7 @@ def _schema_checks(manifest: Mapping[str, Any]) -> list[Check]:
             detail = (
                 f"schema_version {got!r} is supported for reading (current is {SCHEMA_VERSION!r})"
             )
-        checks.append(Check("schema_version", ok, detail))
+        checks.append(Check("schema_version", ok, detail, kind="manifest"))
     if "hash" in manifest:
         got_hash = manifest["hash"]
         expected = {
@@ -145,9 +229,16 @@ def _schema_checks(manifest: Mapping[str, Any]) -> list[Check]:
             if got_hash.get(key) != want
         ]
         if drifts:
-            checks.append(Check("hash", False, "hash descriptor drift — " + "; ".join(drifts)))
+            checks.append(
+                Check(
+                    "hash",
+                    False,
+                    "hash descriptor drift — " + "; ".join(drifts),
+                    kind="manifest",
+                )
+            )
         else:
-            checks.append(Check("hash", True, "hash descriptor matches"))
+            checks.append(Check("hash", True, "hash descriptor matches", kind="manifest"))
     return checks
 
 
@@ -174,6 +265,59 @@ def _compare(stored: Mapping[str, Any], figure: Figure) -> list[str]:
     return drifts
 
 
+def _is_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _legacy_withheld_warnings(receipts: Sequence[Mapping[str, Any]]) -> tuple[VerifyWarning, ...]:
+    """A warning for each 1.0-shaped receipt that displays the redaction marker but carries numbers.
+
+    Schema 1.0 wrote a withheld figure as ``display: "[SUPPRESSED]"`` beside
+    ``value: 0.0``, ``row_count: 0`` and the all-zero slice-hash sentinel. Verify
+    reconstructs that rendering and reports the receipt as re-derived, which is
+    true: the placeholders do still hold. It is also silent about the defect
+    schema 2.0 exists to fix, because a reader of the numeric fields cannot tell
+    those zeros from a true zero. ``examples/housing-demo/receipts.json`` sat in
+    exactly this shape under a green dogfood run until #198.
+
+    It warns rather than fails on purpose. Every manifest written by 0.2.0 or
+    earlier is 1.0, the reusable action installs v0.2.0 by default, and
+    docs/SPEC-STABILITY.md promises that verify reads 1.0; a failure here would
+    turn those runs red with nothing in their data changed. Whether it should
+    ever fail is an open question (#198).
+
+    The test is per receipt, as in ``_compare``: a receipt with no ``suppressed``
+    key is read as 1.0 whatever the envelope declares.
+    """
+
+    warnings: list[VerifyWarning] = []
+    for stored in receipts:
+        if "suppressed" in stored or stored.get("display") != REDACTED_DISPLAY:
+            continue
+        carried = [
+            f"{field}={stored[field]!r}"
+            for field in ("value", "row_count")
+            if _is_number(stored.get(field))
+        ]
+        slice_hash = stored.get("slice_hash")
+        if isinstance(slice_hash, str):
+            carried.append(
+                "the all-zero slice_hash sentinel"
+                if slice_hash == EMPTY_SLICE_HASH
+                else f"slice_hash={slice_hash!r}"
+            )
+        if not carried:
+            continue
+        detail = (
+            f"schema 1.0 receipt displays {REDACTED_DISPLAY} but carries {', '.join(carried)}. "
+            "Those are the placeholders 1.0 wrote for a withheld figure, not a count of zero, "
+            f"and nothing in the numeric fields says so. Re-export at schema {SCHEMA_VERSION}, "
+            "which writes suppressed: true and null numerics."
+        )
+        warnings.append(VerifyWarning(str(stored.get("metric_id", "")), detail))
+    return tuple(warnings)
+
+
 def verify_manifest(figures: Sequence[Figure], manifest: Mapping[str, Any]) -> VerifyResult:
     """Check each manifest receipt against the figure re-derived from the data.
 
@@ -182,11 +326,15 @@ def verify_manifest(figures: Sequence[Figure], manifest: Mapping[str, Any]) -> V
     with no receipt, is reported as a failure so the two sets must agree exactly.
 
     When the manifest carries a ``schema_version`` or ``hash`` descriptor, they are
-    checked against the current constants first, so a manifest written under an
-    unsupported schema fails with a named version/descriptor reason before any
-    per-receipt re-derivation is attempted. A manifest written under an older but
-    still supported schema is compared field-for-field as *that* schema wrote it,
-    so a schema change is not reported as data drift; see ``_recomputed_fields``.
+    checked against the current constants and reported first, so a manifest
+    written under an unsupported schema names its reason at the top. Re-derivation
+    still runs for every receipt underneath it — deliberately, and this docstring
+    used to claim otherwise. Reporting both is what makes a refusal attributable:
+    when the version fails and all the receipts re-derive, the reader can see that
+    the document declared a contract nobody implements rather than that its data
+    moved. A manifest written under an older but still supported schema is compared
+    field-for-field as *that* schema wrote it, so a schema change is not reported
+    as data drift; see ``_recomputed_fields``.
     """
 
     by_id = {figure.metric_id: figure for figure in figures}
@@ -208,7 +356,7 @@ def verify_manifest(figures: Sequence[Figure], manifest: Mapping[str, Any]) -> V
     for metric_id in sorted(by_id):
         if metric_id not in seen:
             checks.append(Check(metric_id, False, "figure has no receipt in the manifest"))
-    return VerifyResult(tuple(checks))
+    return VerifyResult(tuple(checks), warnings=_legacy_withheld_warnings(receipts))
 
 
 @dataclass(frozen=True)
@@ -221,23 +369,87 @@ class ArtifactCheck:
 
 
 @dataclass(frozen=True)
+class CoverageCheck:
+    """Whether the manifest's requirement coverage still holds.
+
+    ``checked`` is false when neither the spec nor the manifest carries a
+    requirement binding -- nothing was compared, which is a different fact from
+    "the comparison passed". A verifier that reported ``ok`` for an unbound spec
+    and ``ok`` for a bound one that matched would be saying the same word about
+    two different situations.
+    """
+
+    checked: bool
+    ok: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class ApprovalCheck:
+    """Whether the manifest's recorded sign-offs still satisfy the spec's policy.
+
+    ``checked`` is false only when neither the spec declares an ``[approval]``
+    policy nor the manifest records one, which is "there was nothing to compare"
+    rather than "the comparison passed". The two are reported with different
+    words for the same reason ``CoverageCheck`` does.
+    """
+
+    checked: bool
+    ok: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class DocumentCheck:
+    """Whether ``report.docx`` says what ``report.md`` says, and its narrative grounds.
+
+    ``checked`` is false only when the bundle holds no document export and the
+    manifest attests none: nothing was compared, which is a different fact from
+    "the comparison passed". ``grounding`` is the gate's result over the
+    narrative read back out of the document's own bytes, and ``None`` when the
+    document could not be read at all.
+    """
+
+    checked: bool
+    ok: bool
+    detail: str
+    grounding: GroundingResult | None = None
+
+
+@dataclass(frozen=True)
 class BundleResult:
     """The whole-bundle verification: receipts, artifact digests, and grounding.
 
     ``manifest`` is the per-receipt re-derivation. ``artifacts`` is one check per
     file the manifest hashes (``report.md``, ``trace.html``, each chart SVG).
-    ``grounding`` re-runs the gate over the exported narrative. The bundle is
-    ``ok`` only when all three hold, so any drift, swap, or ungrounded number
-    fails closed.
+    ``grounding`` re-runs the gate over the exported narrative. ``coverage``
+    re-derives the requirement coverage record and compares it, including the
+    digest of the requirement document, so an edit to that document after export
+    is caught. ``approval`` re-reads the spec's sign-off policy and checks the
+    recorded approvals against it. ``document`` reads ``report.docx`` back out of
+    its bytes, when the export wrote one, and holds it to ``report.md`` and to the
+    gate. The bundle is ``ok`` only when all six hold, so any drift, swap,
+    ungrounded number, moved requirement, sign-off that no longer satisfies the
+    policy, or document that no longer says what its report says fails closed.
     """
 
     manifest: VerifyResult
     artifacts: tuple[ArtifactCheck, ...]
     grounding: GroundingResult
+    coverage: CoverageCheck = CoverageCheck(False, True, "no requirement binding to check")
+    approval: ApprovalCheck = ApprovalCheck(False, True, "no approval policy to check")
+    document: DocumentCheck = DocumentCheck(False, True, "no document export to check")
 
     @property
     def ok(self) -> bool:
-        return self.manifest.ok and all(check.ok for check in self.artifacts) and self.grounding.ok
+        return (
+            self.manifest.ok
+            and all(check.ok for check in self.artifacts)
+            and self.grounding.ok
+            and self.coverage.ok
+            and self.approval.ok
+            and self.document.ok
+        )
 
     @property
     def failed_artifacts(self) -> tuple[ArtifactCheck, ...]:
@@ -289,7 +501,248 @@ def _check_artifacts(bundle_dir: Path, manifest: Mapping[str, Any]) -> tuple[Art
     return tuple(checks)
 
 
-def verify_bundle(bundle_dir: Path, figures: Sequence[Figure]) -> BundleResult:
+def _check_coverage(
+    manifest: Mapping[str, Any], coverage: RequirementCoverage | None
+) -> CoverageCheck:
+    """Compare the manifest's coverage record with a freshly derived one.
+
+    Both directions are failures, and both are real. A manifest that records a
+    binding the spec no longer declares was exported against a requirement set
+    somebody has since removed. A spec that declares a binding the manifest does
+    not carry was exported before the binding existed, and its report proves
+    nothing about the requirement set now in force.
+    """
+
+    recorded = manifest.get("requirements")
+    if recorded is None and coverage is None:
+        return CoverageCheck(False, True, "no requirement binding to check")
+    if recorded is None:
+        return CoverageCheck(
+            True,
+            False,
+            "the spec binds a requirement document but the manifest carries no coverage record",
+        )
+    if coverage is None:
+        return CoverageCheck(
+            True,
+            False,
+            "the manifest carries a coverage record but the spec binds no requirement document",
+        )
+    if not isinstance(recorded, Mapping):
+        return CoverageCheck(True, False, "the manifest's requirements record is not an object")
+    derived = coverage.payload()
+    recorded_digest = recorded.get("document_sha256")
+    if recorded_digest != derived["document_sha256"]:
+        return CoverageCheck(
+            True,
+            False,
+            f"requirement document sha256 {recorded_digest} does not match "
+            f"{derived['document_sha256']} recomputed from {coverage.document_path}",
+        )
+    if dict(recorded) != derived:
+        return CoverageCheck(
+            True,
+            False,
+            "the coverage record does not match the coverage re-derived from the spec and data",
+        )
+    return CoverageCheck(True, True, f"coverage matches; document sha256 {recorded_digest}")
+
+
+def _recorded_approvals(manifest: Mapping[str, Any]) -> list[tuple[str, str]] | None:
+    """The ``role``/``approved_by`` pairs a manifest records, or ``None``.
+
+    ``None`` means the manifest carries no ``approvals`` list at all. A list that
+    is present but malformed returns an empty list instead, so a hand-edited
+    record fails the policy comparison rather than being read as "no policy was
+    in force" and skipping the check.
+    """
+
+    provenance = manifest.get("provenance")
+    if not isinstance(provenance, Mapping):
+        return None
+    recorded = provenance.get("approvals")
+    if recorded is None:
+        return None
+    if not isinstance(recorded, list):
+        return []
+    pairs: list[tuple[str, str]] = []
+    for entry in recorded:
+        if not isinstance(entry, Mapping):
+            continue
+        pairs.append((str(entry.get("role", "")), str(entry.get("approved_by", ""))))
+    return pairs
+
+
+def _check_approval(manifest: Mapping[str, Any], policy: ApprovalPolicy | None) -> ApprovalCheck:
+    """Compare the manifest's recorded sign-offs with the spec's policy now.
+
+    The policy is read from the spec, never from the manifest, for the reason the
+    issue behind this check gives: a requirement that travels with the report
+    definition cannot be satisfied by a different invocation. Both directions are
+    failures. A manifest with no approvals against a spec that requires them was
+    exported before the policy existed, so its report proves nothing about the
+    policy in force. A manifest carrying approvals against a spec that declares
+    none records a gate nothing now defines.
+    """
+
+    recorded = _recorded_approvals(manifest)
+    if policy is None:
+        if recorded is None:
+            return ApprovalCheck(False, True, "no approval policy to check")
+        return ApprovalCheck(
+            True,
+            False,
+            "the manifest records role approvals but the spec declares no [approval] policy",
+        )
+    if recorded is None:
+        return ApprovalCheck(
+            True,
+            False,
+            "the spec requires sign-off from "
+            + ", ".join(repr(role) for role in policy.required)
+            + " but the manifest records no role approvals",
+        )
+    try:
+        approvals = resolve_approvals(policy, recorded, approved_at="")
+    except ApprovalError as exc:
+        return ApprovalCheck(
+            True, False, f"the recorded approvals do not satisfy the policy: {exc}"
+        )
+    return ApprovalCheck(
+        True,
+        True,
+        "sign-off recorded for " + ", ".join(f"{a.role} ({a.name})" for a in approvals),
+    )
+
+
+def _excerpt(text: str, start: int) -> str:
+    begin = max(0, start - 20)
+    end = start + 40
+    return ("…" if begin else "") + repr(text[begin:end]) + ("…" if end < len(text) else "")
+
+
+def _first_difference(expected: Sequence[Block], found: Sequence[Block]) -> str | None:
+    """Where a document first stops saying what ``report.md`` says, or ``None``."""
+
+    for index, (want, got) in enumerate(zip(expected, found, strict=False), start=1):
+        if want == got:
+            continue
+        if want.text == got.text:
+            return f"block {index} has report.md's text in a different form"
+        start = next(
+            (i for i, (a, b) in enumerate(zip(want.text, got.text, strict=False)) if a != b),
+            min(len(want.text), len(got.text)),
+        )
+        return (
+            f"block {index} reads {_excerpt(got.text, start)} where report.md has "
+            f"{_excerpt(want.text, start)}"
+        )
+    if len(expected) != len(found):
+        return f"it has {len(found)} block(s) where report.md renders {len(expected)}"
+    return None
+
+
+def _digits(text: str) -> Counter[str]:
+    return Counter(character for character in text if character.isdecimal())
+
+
+def _document_problems(read: DocxText, report_text: str) -> list[str]:
+    """Every way a document stops saying what ``report.md`` says.
+
+    Three comparisons, and the last two do not trust the first. The blocks are
+    compared with the ones ``report.md`` renders to, character for character.
+    The digits are compared with ``report.md``'s raw text, so a renderer that
+    lost a number could not also hide it by leaving it out of the blocks it
+    expects. The redaction marker is counted against the raw text the same way,
+    so a withheld cell cannot drop out of the document unnoticed.
+    """
+
+    expected = document_blocks(report_text, locale=read.language)
+    problems: list[str] = []
+    difference = _first_difference(expected, read.blocks)
+    if difference is not None:
+        problems.append(f"it does not say what report.md says: {difference}")
+    title = document_title(expected)
+    if read.title != title:
+        problems.append(f"its title {read.title!r} is not report.md's {title!r}")
+    if _digits(read.text) != _digits(report_text):
+        problems.append("it does not carry the same digits as report.md")
+    shown, marked = read.text.count(REDACTED_DISPLAY), report_text.count(REDACTED_DISPLAY)
+    if shown != marked:
+        problems.append(
+            f"it shows {REDACTED_DISPLAY} {shown} time(s) where report.md shows it {marked}"
+        )
+    return problems
+
+
+def check_document(document: bytes, report_text: str, figures: Sequence[Figure]) -> DocumentCheck:
+    """Hold a Word export to the report it was rendered from, and to the gate.
+
+    The document is read back out of its bytes -- never taken from the object
+    that rendered it, which could not disagree with itself -- and compared with
+    what ``report_text`` renders to. Its own narrative is then grounded against
+    ``figures``: the numbers a funder reads in the document, not the ones in the
+    Markdown beside it. ``run --format docx`` calls this before it writes
+    anything, and ``verify --bundle`` calls it again on the file the bundle holds.
+    """
+
+    try:
+        read = read_docx(document)
+    except DocxError as exc:
+        return DocumentCheck(True, False, f"{DOCX_NAME} is not a document this tool wrote: {exc}")
+    problems = _document_problems(read, report_text)
+    grounding = ground(read.narrative, figures)
+    if not grounding.ok:
+        unbound = ", ".join(repr(span.text) for span in grounding.unbound)
+        problems.append(
+            f"{len(grounding.unbound)} number(s) in its narrative bind to no receipt: {unbound}"
+        )
+    if problems:
+        return DocumentCheck(True, False, f"{DOCX_NAME}: " + "; ".join(problems), grounding)
+    return DocumentCheck(
+        True,
+        True,
+        f"{DOCX_NAME} says what report.md says; its narrative grounds "
+        f"{len(grounding.bound)} of {grounding.total} number(s)",
+        grounding,
+    )
+
+
+def _check_bundle_document(
+    bundle_dir: Path,
+    manifest: Mapping[str, Any],
+    report_text: str,
+    figures: Sequence[Figure],
+) -> DocumentCheck:
+    """The document check for a bundle, in both directions.
+
+    A ``report.docx`` the manifest does not attest is a failure rather than an
+    unchecked extra: nothing in the export says this run wrote it, so a reader
+    holding it has no receipt for it. An attested one that is missing is a
+    failure too, and the artifact check names it as well.
+    """
+
+    artifacts = manifest.get("artifacts")
+    attested = isinstance(artifacts, Mapping) and DOCX_NAME in artifacts
+    path = bundle_dir / DOCX_NAME
+    if not attested and not path.is_file():
+        return DocumentCheck(False, True, "no document export to check")
+    if not attested:
+        return DocumentCheck(
+            True, False, f"{DOCX_NAME} is in the bundle but the manifest does not attest it"
+        )
+    if not path.is_file():
+        return DocumentCheck(True, False, f"the manifest attests {DOCX_NAME} but it is missing")
+    return check_document(path.read_bytes(), report_text, figures)
+
+
+def verify_bundle(
+    bundle_dir: Path,
+    figures: Sequence[Figure],
+    *,
+    coverage: RequirementCoverage | None = None,
+    approval_policy: ApprovalPolicy | None = None,
+) -> BundleResult:
     """Verify an exported bundle is internally coherent, not just re-derivable.
 
     Beyond re-deriving every receipt (``verify_manifest``), this reads each file
@@ -297,7 +750,9 @@ def verify_bundle(bundle_dir: Path, figures: Sequence[Figure]) -> BundleResult:
     ``trace.html``, or chart SVG is caught; and it re-runs the grounding gate over
     the exported narrative, so a number that no longer binds to a receipt is
     caught. It fails closed: a manifest with no ``artifacts`` key is an error, and
-    a missing artifact file is a failure.
+    a missing artifact file is a failure. When the manifest attests
+    ``report.docx``, the document is read back out of its bytes and held to
+    ``report.md`` and to the gate; a ``report.docx`` it does not attest fails.
     """
 
     bundle_dir = Path(bundle_dir)
@@ -308,4 +763,11 @@ def verify_bundle(bundle_dir: Path, figures: Sequence[Figure]) -> BundleResult:
     report_path = bundle_dir / "report.md"
     report_text = report_path.read_text(encoding="utf-8") if report_path.is_file() else ""
     grounding = ground(_report_narrative(report_text), figures)
-    return BundleResult(manifest_result, artifacts, grounding)
+    return BundleResult(
+        manifest_result,
+        artifacts,
+        grounding,
+        _check_coverage(manifest, coverage),
+        _check_approval(manifest, approval_policy),
+        _check_bundle_document(bundle_dir, manifest, report_text, figures),
+    )

@@ -5,7 +5,10 @@ template, the metric definitions, and four optional sections. ``[[charts]]`` dra
 a chart from named figures, ``[comparison]`` compares a set of metrics across two
 periods, ``[reconciliation]`` pairs each outcome figure with a financial line over
 the same two periods, and ``[[data_checks]]`` declares data-quality preconditions
-asserted before any figure is computed, and ``[[report.templates]]`` names several funder formats
+asserted before any figure is computed, ``[requirements]`` binds the export to a
+funder's requirement document so export must prove it answered the set,
+``[approval]`` names the sign-off roles an export must record before it may be
+written, and ``[[report.templates]]`` names several funder formats
 that render the same shared figures. Every number a chart or comparison renders is
 still a figure with a receipt; nothing here introduces an ungrounded path to a
 number. A metric may also carry optional logic-model mapping keys (``indicator``,
@@ -21,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from outcome_receipts.models import (
+    ApprovalPolicy,
     ChartSpec,
     ComparisonSpec,
     DataCheck,
@@ -30,7 +34,10 @@ from outcome_receipts.models import (
     ReconciliationRow,
     ReconciliationSpec,
     ReportSpec,
+    RequirementsSpec,
     TemplateSpec,
+    UnanswerableRequirement,
+    role_key,
 )
 
 _VALID_UNITS = frozenset({"count", "percent", "money", "duration", "rate"})
@@ -46,6 +53,11 @@ class Spec:
     data_path: Path
     report: ReportSpec
     schema_version: str = SPEC_SCHEMA_VERSION
+    #: The bound requirement document, resolved against the spec's directory, or
+    #: ``None`` when the spec declares no ``[requirements]`` section. ``None`` is
+    #: "this spec makes no coverage claim", which is a different fact from "the
+    #: requirement document declares nothing".
+    requirements_path: Path | None = None
 
 
 def _resolve(base: Path, value: str) -> Path:
@@ -79,6 +91,7 @@ def _parse_metric(metric_id: str, body: dict[str, Any]) -> MetricSpec:
         data_source=str(body.get("data_source", "")),
         collection_frequency=str(body.get("collection_frequency", "")),
         caveat=str(body.get("caveat", "")),
+        requirement_id=str(body.get("requirement_id", "")).strip(),
     )
 
 
@@ -111,6 +124,79 @@ def _parse_charts(raw: object) -> tuple[ChartSpec, ...]:
             )
         )
     return tuple(charts)
+
+
+def _parse_requirements(raw: object) -> RequirementsSpec | None:
+    """Parse the optional ``[requirements]`` binding.
+
+    Additive in exactly the way ``[[data_checks]]`` is: absent means the spec
+    makes no coverage claim and every byte of its export is what it was before.
+    Present means export must prove the requirement set was answered.
+    """
+
+    if not raw:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("[requirements] must be a table")
+    path = str(raw.get("path", "")).strip()
+    if not path:
+        raise ValueError("[requirements] must set 'path' to the requirement document")
+    unanswerable_raw = raw.get("unanswerable", [])
+    if not isinstance(unanswerable_raw, list):
+        raise ValueError("[[requirements.unanswerable]] must be an array of tables")
+    declarations: list[UnanswerableRequirement] = []
+    for entry in unanswerable_raw:
+        if not isinstance(entry, dict):
+            raise ValueError("each [[requirements.unanswerable]] entry must be a table")
+        missing = [key for key in ("requirement_id", "blocker", "reason") if key not in entry]
+        if missing:
+            raise ValueError(
+                "each [[requirements.unanswerable]] entry must set "
+                f"'requirement_id', 'blocker' and 'reason'; missing {', '.join(missing)}"
+            )
+        declarations.append(
+            UnanswerableRequirement(
+                requirement_id=str(entry["requirement_id"]).strip(),
+                blocker=str(entry["blocker"]).strip(),
+                reason=str(entry["reason"]).strip(),
+            )
+        )
+    return RequirementsSpec(path=path, unanswerable=tuple(declarations))
+
+
+def _parse_approval(raw: object) -> ApprovalPolicy | None:
+    """Parse the optional ``[approval]`` sign-off policy.
+
+    ``raw is None`` rather than ``not raw`` on purpose. An absent section means
+    the spec makes no role requirement and the single-approver path applies
+    unchanged. A present but empty ``[approval]`` table would mean a declared
+    sign-off gate that demands nobody, which reads in the manifest exactly like a
+    satisfied one. That is an authoring mistake and it is refused here, naming
+    the key, rather than loaded as a policy that cannot fail.
+    """
+
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("[approval] must be a table")
+    required_raw = raw.get("required")
+    if not isinstance(required_raw, list) or not required_raw:
+        raise ValueError("[approval] must set 'required' to a non-empty array of role names")
+    roles: list[str] = []
+    seen: dict[str, str] = {}
+    for entry in required_raw:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ValueError("[approval] required roles must be non-empty strings")
+        role = entry.strip()
+        key = role_key(role)
+        if key in seen:
+            raise ValueError(
+                f"[approval] names role {role!r} more than once (already required as "
+                f"{seen[key]!r}); one role cannot be two sign-offs"
+            )
+        seen[key] = role
+        roles.append(role)
+    return ApprovalPolicy(required=tuple(roles))
 
 
 def _parse_data_checks(raw: object) -> tuple[DataCheck, ...]:
@@ -286,6 +372,8 @@ def load_spec(path: str | Path) -> Spec:
     comparison = _parse_comparison(data.get("comparison"))
     data_checks = _parse_data_checks(data.get("data_checks"))
     reconciliation = _parse_reconciliation(data.get("reconciliation"))
+    requirements = _parse_requirements(data.get("requirements"))
+    approval = _parse_approval(data.get("approval"))
     drafting_raw = report_section.get("drafting", {})
     if not isinstance(drafting_raw, dict):
         raise ValueError("[report.drafting] must be a table")
@@ -310,9 +398,12 @@ def load_spec(path: str | Path) -> Spec:
         reconciliation=reconciliation,
         templates=templates,
         drafting=drafting,
+        requirements=requirements,
+        approval=approval,
     )
     return Spec(
         data_path=_resolve(base, str(data_section["path"])),
         report=report,
         schema_version=raw_schema_version,
+        requirements_path=(None if requirements is None else _resolve(base, requirements.path)),
     )

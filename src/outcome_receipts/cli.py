@@ -11,6 +11,8 @@ Commands:
   audit   run the grounding gate over an existing narrative file, against the
           figures the report may publish, and report both unbound numbers and
           numbers that state a cell small-cell suppression withholds
+  mcp     serve audit, verify, trace, and the publishable figure list to a
+          drafting tool over stdio, read-only (no export, no network)
   verify  re-derive every receipt in a manifest from the spec and data, and fail
           on any drift
   verify-ledger
@@ -46,17 +48,31 @@ argparse only; no runtime dependency beyond the standard library.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
+import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from outcome_receipts import __version__
 from outcome_receipts.bundle import bundle_manifest
 from outcome_receipts.bundle import verify_bundle as verify_signed_bundle
 from outcome_receipts.cards import write_cards
 from outcome_receipts.charts import Chart, render_charts
+from outcome_receipts.claims import (
+    STATUS_BOUND,
+    ClaimAudit,
+    DirectionEvidence,
+    audit_claims,
+    audit_payload,
+    evidence_from_rows,
+    summarize,
+)
 from outcome_receipts.clock import Clock, FixedClock, SystemClock
 from outcome_receipts.comparison import (
     ComparisonResult,
@@ -65,11 +81,25 @@ from outcome_receipts.comparison import (
     compute_reconciliation,
 )
 from outcome_receipts.config import Spec, load_spec
+from outcome_receipts.coverage import (
+    CoverageError,
+    RequirementCoverage,
+    build_requirement_coverage,
+)
 from outcome_receipts.diff import diff_manifests
+from outcome_receipts.docx import DOCX_NAME, DocxError, render_docx
 from outcome_receipts.draft import draft, draft_template
 from outcome_receipts.engine import compute_figures, read_csv_meta
 from outcome_receipts.evaluate import EvalReport, evaluate
-from outcome_receipts.grounding import audit_narrative, ground
+from outcome_receipts.grounding import (
+    FixPlanRefused,
+    apply_fix_plan,
+    audit_narrative,
+    build_fix_plan,
+    explain_audit,
+    explain_unbound,
+    ground,
+)
 from outcome_receipts.ledger import LedgerEntry, append_export, read_ledger, verify_chain
 from outcome_receipts.mapping import build_mapping_queue
 from outcome_receipts.model_draft import (
@@ -78,13 +108,47 @@ from outcome_receipts.model_draft import (
     build_narrative_drafter,
 )
 from outcome_receipts.models import (
+    ApprovalPolicy,
+    AuditResult,
+    Explanation,
     Figure,
     GroundingResult,
     NumericSpan,
+    SpanCandidate,
     SuppressedSpan,
     TemplateSpec,
+    role_key,
 )
-from outcome_receipts.provenance import Provenance
+from outcome_receipts.policy import (
+    DEFAULT_POLICY_ID,
+    SuppressionPolicy,
+    UnknownPolicyError,
+    ad_hoc_policy,
+    get_policy,
+)
+from outcome_receipts.portfolio import (
+    PAGE_NAME,
+    PortfolioError,
+    PortfolioIndex,
+    PortfolioReport,
+    ReportVerification,
+    read_index,
+    render_index_html,
+    shared_figures,
+    write_index,
+)
+from outcome_receipts.preview import (
+    preview_payload,
+    preview_policies,
+    render_preview_markdown,
+)
+from outcome_receipts.provenance import (
+    Approval,
+    ApprovalError,
+    Provenance,
+    approvals_summary,
+    resolve_approvals,
+)
 from outcome_receipts.report import (
     receipts_manifest,
     render_diff_markdown,
@@ -93,13 +157,22 @@ from outcome_receipts.report import (
 )
 from outcome_receipts.scaffold import scaffold_spec
 from outcome_receipts.suppression import (
+    SuppressionResult,
     filter_for_aggregate_only,
     redact_comparison,
     redact_reconciliation,
     suppress_figures,
 )
 from outcome_receipts.trace import render_trace_html
-from outcome_receipts.verify import BundleResult, VerifyResult, verify_bundle, verify_manifest
+from outcome_receipts.verify import (
+    BundleResult,
+    Check,
+    DocumentCheck,
+    VerifyResult,
+    check_document,
+    verify_bundle,
+    verify_manifest,
+)
 from outcome_receipts.workflows import (
     WorkflowError,
     build_contract_evidence,
@@ -134,6 +207,15 @@ EXIT_GATE_FAIL = 2
 nothing."""
 
 EXIT_APPROVAL_FAIL = 3
+
+# 4: the export answers a bound requirement set incompletely. Distinct from the
+# grounding gate (2), which asks whether every number in the prose traces to a
+# receipt, and from approval (3). This asks the other half: whether every number
+# the funder required was published, withheld with its cell marked, or declared
+# unanswerable with a reason. A run can pass the gate, be approved, and still
+# ship a report that silently omits a required figure -- that is the failure this
+# code names.
+EXIT_COVERAGE_FAIL = 4
 """The export was not approved: the grounding gate passed but no named human
 signed off, so ``run`` wrote nothing."""
 
@@ -270,6 +352,43 @@ def _claims_text(
     return " ".join(parts)
 
 
+def _direction_evidence(
+    comparison: ComparisonResult | None,
+    reconciliation: ReconciliationResult | None,
+    withheld_metric_ids: Sequence[str] = (),
+) -> tuple[DirectionEvidence, ...]:
+    """Every receipted direction a comparative claim in prose may be checked against.
+
+    A reconciliation line is two comparison rows -- an outcome and its spend -- and
+    both are evidence, because a claim about either is a claim about a direction this
+    report computed. The rows must be the *pre*-suppression ones: a redacted row's
+    ``direction`` is a sentinel, and reading it would turn a claim that discloses a
+    withheld comparison into a claim that merely has nothing to bind to.
+    """
+
+    rows: list[object] = []
+    if comparison is not None:
+        rows.extend(comparison.rows)
+    if reconciliation is not None:
+        for line in reconciliation.rows:
+            rows.append(line.outcome)
+            rows.append(line.financial)
+    return evidence_from_rows(rows, withheld_metric_ids)
+
+
+def _print_claim_audit(label: str, audit: ClaimAudit) -> None:
+    summary = summarize(audit)
+    print(
+        f"comparative claims in {label!r}: {summary.total} "
+        f"(bound {summary.bound}, unbound {summary.unbound}, "
+        f"contradicted {summary.contradicted}, disclosed {summary.disclosed})"
+    )
+    for verdict in audit.verdicts:
+        if verdict.status == STATUS_BOUND:
+            continue
+        print(f"  {verdict.status}: at offset {verdict.span.start}, {verdict.detail}")
+
+
 def _approver(
     title: str,
     narrative_result: GroundingResult,
@@ -310,6 +429,163 @@ def _approver(
     return entered_name or None
 
 
+def _approve_pairs(args: argparse.Namespace) -> list[tuple[str, str]]:
+    """The ``--approve ROLE:NAME`` sign-offs as ``(role, name)`` pairs.
+
+    Split on the first colon only, so a name may contain one. A value with no
+    colon is refused rather than read as a role with a blank approver, which
+    would otherwise reach the policy check as a missing name and blame the spec
+    for a typo on the command line.
+    """
+
+    pairs: list[tuple[str, str]] = []
+    for raw in getattr(args, "approve", None) or []:
+        role, separator, name = str(raw).partition(":")
+        if not separator or not role.strip():
+            raise ApprovalError(f"--approve expects ROLE:NAME, got {raw!r}")
+        pairs.append((role.strip(), name.strip()))
+    return pairs
+
+
+def _prompt_for_roles(
+    policy: ApprovalPolicy,
+    supplied: Sequence[tuple[str, str]],
+    args: argparse.Namespace,
+) -> list[tuple[str, str]]:
+    """Prompt for each required role the command line did not fill.
+
+    Only on a TTY, and never under ``--json`` (stdout carries exactly one JSON
+    object) or ``--no-confirm``. Off a TTY there is nobody to prompt, so the
+    unfilled roles stay unfilled and ``resolve_approvals`` refuses by name --
+    which is the fail-closed direction, and the same one the single-approver path
+    already takes.
+    """
+
+    if args.no_confirm or args.json or not sys.stdin.isatty():
+        return []
+    given = {role_key(role) for role, _name in supplied}
+    collected: list[tuple[str, str]] = []
+    for role in policy.required:
+        if role_key(role) in given:
+            continue
+        try:
+            entered = input(f"Sign off as {role!r}? Type your name (blank to abort): ")
+        except EOFError:
+            return collected
+        name = entered.strip()
+        if not name:
+            return collected
+        collected.append((role, name))
+    return collected
+
+
+def _resolve_role_approvals(
+    spec: Spec, args: argparse.Namespace, *, approved_at: str, interactive: bool
+) -> tuple[Approval, ...]:
+    """The role sign-offs this invocation records, checked against the spec.
+
+    Returns an empty tuple when the spec declares no ``[approval]`` policy, which
+    leaves the single-approver path exactly as it was. Raises ``ApprovalError``
+    when a policy exists and the sign-offs do not satisfy it.
+    """
+
+    policy = spec.report.approval
+    supplied = _approve_pairs(args)
+    if policy is None:
+        resolve_approvals(None, supplied, approved_at=approved_at)
+        return ()
+    if getattr(args, "approved_by", None) is not None:
+        raise ApprovalError(
+            "this spec requires sign-off from "
+            + ", ".join(repr(role) for role in policy.required)
+            + "; --approved-by records one unnamed role and cannot satisfy that policy, "
+            "so use --approve ROLE:NAME once per role"
+        )
+    if interactive:
+        supplied = [*supplied, *_prompt_for_roles(policy, supplied, args)]
+    return resolve_approvals(policy, supplied, approved_at=approved_at)
+
+
+def _workflow_approver(config_path: str, args: argparse.Namespace) -> str:
+    """The ``approved_by`` string a workflow command records, policy checked.
+
+    A workflow artifact is evidence packaged from a spec's receipts, so the
+    spec's sign-off policy governs it too. Without this, a two-role spec could be
+    packaged as a contract-check or an equity review with one signature, which is
+    the bypass the policy exists to close: the requirement has to travel with the
+    report definition rather than with the flag the operator happened to type.
+    """
+
+    spec = load_spec(config_path)
+    approvals = _resolve_role_approvals(
+        spec,
+        args,
+        approved_at=_clock(reproducible=args.reproducible).now_iso(),
+        interactive=False,
+    )
+    if approvals:
+        return approvals_summary(approvals)
+    approved_by = str(getattr(args, "approved_by", None) or "").strip()
+    if not approved_by:
+        raise ApprovalError("no approver sign-off: pass --approved-by NAME")
+    return approved_by
+
+
+def _export_approval(
+    spec: Spec,
+    args: argparse.Namespace,
+    narrative_result: GroundingResult,
+    claims_result: GroundingResult,
+    *,
+    approved_at: str,
+) -> tuple[tuple[Approval, ...], str | None, str]:
+    """Who signed this export off, or why nobody did.
+
+    Returns the role approvals (empty for a spec with no policy), the display
+    string to record as ``approved_by``, and the reason to print when that string
+    is ``None``. The refusal is returned rather than raised so ``run --json``
+    still emits exactly one JSON object on the way out.
+    """
+
+    try:
+        approvals = _resolve_role_approvals(spec, args, approved_at=approved_at, interactive=True)
+    except ApprovalError as exc:
+        return (), None, str(exc)
+    if approvals:
+        return approvals, approvals_summary(approvals), ""
+    approver = _approver(spec.report.title, narrative_result, claims_result, args)
+    return (), approver, "no approver sign-off"
+
+
+def _print_approval(approver: str, approvals: Sequence[Approval]) -> None:
+    """Report who signed off, one line per role when the spec declares any."""
+
+    if not approvals:
+        print(f"  approved: {approver}")
+        return
+    for approval in approvals:
+        print(f"  approved ({approval.role}): {approval.name}")
+
+
+def _approval_payload(
+    approver: str, approved_at: str, approvals: Sequence[Approval]
+) -> dict[str, object]:
+    """The ``approval`` block of a ``run --json`` payload.
+
+    ``approved_by`` is present either way and names every approver, so a consumer
+    reading only that field reads a complete answer for a role-based export as
+    well as a single-approver one. ``approvals`` appears only when the spec
+    declared a policy, matching the manifest.
+    """
+
+    payload: dict[str, object] = {"approved_by": approver, "approved_at": approved_at}
+    if approvals:
+        payload["approvals"] = [
+            {"role": a.role, "approved_by": a.name, "approved_at": a.approved_at} for a in approvals
+        ]
+    return payload
+
+
 def _run_payload(
     *,
     gate_pass: bool,
@@ -337,7 +613,49 @@ def _run_payload(
     }
 
 
-def _export_outputs(
+class _DocumentRefused(Exception):
+    """``run --format docx`` built a document that does not hold; nothing was written."""
+
+    def __init__(self, template_id: str, check: DocumentCheck) -> None:
+        super().__init__(check.detail)
+        self.template_id = template_id
+        self.check = check
+
+
+@dataclass(frozen=True)
+class _ExportBuild:
+    """One template's export, built in memory so every one can be checked before any is written."""
+
+    title: str
+    report_text: str
+    trace_text: str
+    manifest_text: str
+    document: bytes | None
+
+
+def _build_document(
+    report_text: str, figures: Sequence[Figure], *, locale: str, template_id: str
+) -> bytes:
+    """Render ``report.docx`` from the report text and gate it on its own bytes.
+
+    The check reads the written bytes back, never the blocks that produced them,
+    and grounds the narrative it finds against the publishable figures. A report
+    carrying a character a Word document cannot hold is refused here too, rather
+    than exported with the character silently gone.
+    """
+
+    try:
+        document = render_docx(report_text, locale=locale)
+    except DocxError as exc:
+        refused = DocumentCheck(True, False, f"{DOCX_NAME} cannot be written: {exc}")
+        raise _DocumentRefused(template_id, refused) from exc
+    check = check_document(document, report_text, figures)
+    if not check.ok:
+        raise _DocumentRefused(template_id, check)
+    return document
+
+
+def _build_export(
     args: argparse.Namespace,
     spec: Spec,
     figures: Sequence[Figure],
@@ -347,17 +665,18 @@ def _export_outputs(
     reconciliation: ReconciliationResult | None,
     provenance: Provenance,
     *,
-    out_dir: Path | None = None,
     title: str | None = None,
-    ledger_path: Path | None = None,
-) -> tuple[dict[str, str | None], LedgerEntry, Path]:
-    """Write the report, trace, charts, and manifest, then append the export ledger.
+    coverage: RequirementCoverage | None = None,
+    template_id: str = "",
+) -> _ExportBuild:
+    """Build the report, trace, optional document, and manifest, all in memory.
 
-    Every artifact string is built in memory first so the manifest, written last,
-    can hash its siblings. The manifest never hashes itself; the report embeds
-    the receipts section but not the artifact digests, so the hash relation is
-    one-directional (no circularity). See ADR 0006. Write order: charts, then
-    report, then trace, then the manifest, then the ledger entry.
+    Every artifact is built before the manifest so the manifest can hash its
+    siblings. The manifest never hashes itself; the report embeds the receipts
+    section but not the artifact digests, so the hash relation is one-directional
+    (no circularity). See ADR 0006. ``report.docx`` is rendered from the finished
+    report text, gated, and hashed like any other artifact; without
+    ``--format docx`` nothing about the build changes.
     """
 
     export_title = title or spec.report.title
@@ -370,6 +689,7 @@ def _export_outputs(
         charts=charts,
         chart_dir=_CHART_DIR,
         provenance=provenance,
+        coverage=coverage,
         locale=args.locale,
     )
     trace_text = render_trace_html(
@@ -386,9 +706,32 @@ def _export_outputs(
     }
     for chart in charts:
         digests[f"{_CHART_DIR}/{chart.chart_id}.svg"] = _sha256(chart.svg)
-    manifest_text = receipts_manifest(figures, provenance=provenance, artifacts=digests)
+    document: bytes | None = None
+    if getattr(args, "document_format", "md") == "docx":
+        document = _build_document(
+            report_text, figures, locale=args.locale, template_id=template_id
+        )
+        digests[DOCX_NAME] = hashlib.sha256(document).hexdigest()
+    manifest_text = receipts_manifest(
+        figures, provenance=provenance, artifacts=digests, coverage=coverage
+    )
+    return _ExportBuild(export_title, report_text, trace_text, manifest_text, document)
 
-    out_dir = out_dir or Path(args.out)
+
+def _write_export(
+    args: argparse.Namespace,
+    build: _ExportBuild,
+    charts: Sequence[Chart],
+    *,
+    out_dir: Path,
+    ledger_path: Path,
+) -> tuple[dict[str, str | None], LedgerEntry]:
+    """Write one built export, then append the export ledger.
+
+    Write order: charts, then the report and its document, then the trace, then
+    the manifest, then the ledger entry.
+    """
+
     out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / "report.md"
     manifest_path = out_dir / "receipts.json"
@@ -405,21 +748,22 @@ def _export_outputs(
         for chart in charts:
             (chart_dir / f"{chart.chart_id}.svg").write_text(chart.svg, encoding="utf-8")
         outputs["charts"] = str(chart_dir)
-    report_path.write_text(report_text, encoding="utf-8")
-    trace_path.write_text(trace_text, encoding="utf-8")
-    manifest_path.write_text(manifest_text, encoding="utf-8")
+    report_path.write_text(build.report_text, encoding="utf-8")
+    if build.document is not None:
+        document_path = out_dir / DOCX_NAME
+        document_path.write_bytes(build.document)
+        outputs["document"] = str(document_path)
+    trace_path.write_text(build.trace_text, encoding="utf-8")
+    manifest_path.write_text(build.manifest_text, encoding="utf-8")
 
-    ledger_path = ledger_path or (
-        Path(args.ledger) if args.ledger else out_dir.parent / "export-ledger.jsonl"
-    )
     entry = append_export(
         ledger_path,
-        report_title=export_title,
-        manifest_json_or_hash=manifest_text,
+        report_title=build.title,
+        manifest_json_or_hash=build.manifest_text,
         recipient=args.recipient,
         clock=_clock(reproducible=args.reproducible),
     )
-    return outputs, entry, ledger_path
+    return outputs, entry
 
 
 def _draft_templates(
@@ -459,11 +803,46 @@ def _print_template_summary(
         )
 
 
+def _print_run_summary(
+    publishable: Sequence[Figure],
+    claims_result: GroundingResult,
+    drafts: Sequence[tuple[TemplateSpec, str, GroundingResult]],
+    claim_audits: Sequence[tuple[TemplateSpec, ClaimAudit]],
+    suppression: SuppressionResult,
+) -> None:
+    """What the run found, before it says whether it will export."""
+
+    _print_template_summary(publishable, claims_result, drafts)
+    for template, audit in claim_audits:
+        _print_claim_audit(template.template_id, audit)
+    n_hidden = len(suppression.suppressed) + len(suppression.complementary_suppressed)
+    print(f"suppression policy: applied (threshold {suppression.threshold}; hidden {n_hidden})")
+
+
 def _print_gate_failure(
     claims_result: GroundingResult,
     drafts: Sequence[tuple[TemplateSpec, str, GroundingResult]],
+    publishable: Sequence[Figure] = (),
+    *,
+    explain: bool = False,
+    claim_audits: Sequence[tuple[TemplateSpec, ClaimAudit]] = (),
 ) -> None:
+    """Report the refusal, and on request why each number missed.
+
+    The refusal lines print whether or not a diagnosis was asked for, and the
+    diagnosis is only ever added beneath them. ``run`` still writes nothing and
+    still exits ``EXIT_GATE_FAIL``: explaining a refusal does not soften it.
+    """
+
     print("\ngrounding gate: FAIL — refusing to export", file=sys.stderr)
+    for template, audit in claim_audits:
+        for verdict in audit.verdicts:
+            if verdict.status == STATUS_BOUND:
+                continue
+            print(
+                f"  {verdict.status} claim in {template.template_id!r}: {verdict.detail}",
+                file=sys.stderr,
+            )
     for span in claims_result.unbound:
         print(f"  unverifiable number: {span.text!r}", file=sys.stderr)
     for template, _narrative, result in drafts:
@@ -472,6 +851,14 @@ def _print_gate_failure(
                 f"  unverifiable number in {template.template_id!r}: {span.text!r}",
                 file=sys.stderr,
             )
+    if not explain:
+        return
+    spans = [
+        *claims_result.unbound,
+        *(span for _template, _narrative, result in drafts for span in result.unbound),
+    ]
+    for explanation in explain_unbound(spans, publishable):
+        print(f"  why {explanation.span.text!r}: {explanation.detail}", file=sys.stderr)
 
 
 def _write_template_exports(
@@ -489,11 +876,14 @@ def _write_template_exports(
     *,
     suppression_applied: bool = False,
     narrative_drafter: str = "deterministic",
+    coverage: RequirementCoverage | None = None,
+    approvals: Sequence[Approval] = (),
 ) -> tuple[list[tuple[TemplateSpec, dict[str, str | None], LedgerEntry]], Path, bool]:
     base_out = Path(args.out)
     fan_out = bool(spec.report.templates)
     ledger_path = Path(args.ledger) if args.ledger else base_out.parent / "export-ledger.jsonl"
     written: list[tuple[TemplateSpec, dict[str, str | None], LedgerEntry]] = []
+    builds: list[tuple[TemplateSpec, Path, _ExportBuild]] = []
     for template, narrative, result in drafts:
         provenance = Provenance(
             numbers_bound=len(result.bound) + len(claims_result.bound),
@@ -503,9 +893,10 @@ def _write_template_exports(
             suppression_applied=suppression_applied,
             aggregate_only=True,
             narrative_drafter=narrative_drafter,
+            approvals=tuple(approvals),
         )
         out_dir = base_out / template.template_id if fan_out else base_out
-        outputs, entry, _ = _export_outputs(
+        build = _build_export(
             args,
             spec,
             figures,
@@ -514,9 +905,17 @@ def _write_template_exports(
             comparison,
             reconciliation,
             provenance,
-            out_dir=out_dir,
             title=template.title,
-            ledger_path=ledger_path,
+            coverage=coverage,
+            template_id=template.template_id,
+        )
+        builds.append((template, out_dir, build))
+    # Every template is built, and its document gated, before any is written, so a
+    # refusal for the second template cannot leave the first on disk and in the
+    # ledger as an export nobody finished.
+    for template, out_dir, build in builds:
+        outputs, entry = _write_export(
+            args, build, charts, out_dir=out_dir, ledger_path=ledger_path
         )
         bundle_path = out_dir / _BUNDLE_NAME
         bundle_path.write_text(bundle_manifest(_bundle_members(out_dir), key=key), encoding="utf-8")
@@ -537,6 +936,250 @@ def _redact_report_structures(
     return comparison, reconciliation
 
 
+def _requirement_coverage(spec: Spec, figures: Sequence[Figure]) -> RequirementCoverage | None:
+    """Coverage for a bound spec, or ``None`` when the spec binds no requirements.
+
+    ``None`` means "this spec makes no coverage claim". It is not the same fact
+    as a coverage record whose counts are all zero, and the two are never
+    rendered the same way: an unbound spec carries no `requirements` key in its
+    manifest at all.
+    """
+
+    if spec.requirements_path is None or spec.report.requirements is None:
+        return None
+    return build_requirement_coverage(
+        requirements=spec.report.requirements,
+        requirements_path=spec.requirements_path,
+        data_path=spec.data_path,
+        metric_requirements={
+            metric.metric_id: metric.requirement_id
+            for metric in spec.report.metrics
+            if metric.requirement_id
+        },
+        figures=figures,
+    )
+
+
+def _print_coverage_failure(coverage: RequirementCoverage) -> None:
+    print(
+        f"\nrequirement coverage: FAIL — {len(coverage.unanswered)} of "
+        f"{len(coverage.records)} requirements in {coverage.document_path} "
+        "are neither answered nor declared unanswerable",
+        file=sys.stderr,
+    )
+    for record in coverage.unanswered:
+        print(f"  {record.requirement_id}: {record.detail}", file=sys.stderr)
+
+
+def _refuse_for_grounding(
+    args: argparse.Namespace,
+    *,
+    gate_pass: bool,
+    raw_gate_pass: bool,
+    raw_claims: GroundingResult,
+    raw_drafts: Sequence[tuple[TemplateSpec, str, GroundingResult]],
+    figures: Sequence[Figure],
+    publishable: Sequence[Figure],
+    claims_result: GroundingResult,
+    drafts: Sequence[tuple[TemplateSpec, str, GroundingResult]],
+    combined_result: GroundingResult,
+    outputs: object,
+    template_payload: Mapping[str, object],
+    claim_audits: Sequence[tuple[TemplateSpec, ClaimAudit]],
+    claim_payload: object,
+) -> int | None:
+    """Refuse the export when the grounding gate failed, or ``None`` when it passed."""
+
+    if gate_pass:
+        return None
+    if args.json:
+        payload = _run_payload(
+            gate_pass=False,
+            figures=publishable,
+            narrative_result=combined_result,
+            claims_result=claims_result,
+            outputs=outputs,
+            ledger=None,
+            approval=None,
+        )
+        payload["templates"] = dict(template_payload)
+        payload["comparative_claims"] = claim_payload
+        _emit_json(payload)
+        return EXIT_GATE_FAIL
+    if not raw_gate_pass:
+        # The raw drafts failed, so the raw figure set is the one they were
+        # written against and the only set a diagnosis of them can be true
+        # about. Explaining raw spans against the publishable set would
+        # report a suppressed figure as simply missing.
+        _print_gate_failure(
+            raw_claims, raw_drafts, figures, explain=args.explain, claim_audits=claim_audits
+        )
+    else:
+        _print_gate_failure(
+            claims_result,
+            drafts,
+            publishable,
+            explain=args.explain,
+            claim_audits=claim_audits,
+        )
+    return EXIT_GATE_FAIL
+
+
+def _print_coverage_pass(coverage: RequirementCoverage | None) -> None:
+    """One line for a bound spec, and nothing at all for an unbound one."""
+
+    if coverage is None:
+        return
+    counts = coverage.counts()
+    print(
+        f"requirement coverage: PASS — {counts['answered']} answered, "
+        f"{counts['withheld']} withheld, {counts['unanswerable']} unanswerable "
+        f"of {len(coverage.records)} in {coverage.document_path}"
+    )
+
+
+def _with_coverage(
+    payload: dict[str, object], coverage: RequirementCoverage | None
+) -> dict[str, object]:
+    """Add the coverage record, or leave the payload without the key entirely.
+
+    Absent, not an empty object: a spec that binds no requirement document has
+    not answered zero requirements, it has made no coverage claim at all.
+    """
+
+    if coverage is not None:
+        payload["requirements"] = coverage.payload()
+    return payload
+
+
+def _refuse_for_coverage(
+    args: argparse.Namespace,
+    coverage: RequirementCoverage | None,
+    *,
+    figures: Sequence[Figure],
+    narrative_result: GroundingResult,
+    claims_result: GroundingResult,
+    outputs: object,
+    template_payload: Mapping[str, object],
+    claim_payload: object,
+) -> int | None:
+    """Refuse the export and write nothing, naming every unanswered requirement.
+
+    ``None`` means there is nothing to refuse: either the spec binds no
+    requirement document, or every requirement is answered, withheld, or
+    declared unanswerable with a blocker `map` reproduced.
+
+    ``gate_pass`` is reported as true in the JSON because it was: the grounding
+    gate passed and this is the other gate. Reporting it as a grounding failure
+    would send whoever reads the JSON to look for an unbound number that is not
+    there.
+    """
+
+    if coverage is None or coverage.ok:
+        return None
+    if args.json:
+        payload = _run_payload(
+            gate_pass=True,
+            figures=figures,
+            narrative_result=narrative_result,
+            claims_result=claims_result,
+            outputs=outputs,
+            ledger=None,
+            approval=None,
+        )
+        payload["templates"] = dict(template_payload)
+        payload["comparative_claims"] = claim_payload
+        payload["requirements"] = coverage.payload()
+        _emit_json(payload)
+        return EXIT_COVERAGE_FAIL
+    _print_coverage_failure(coverage)
+    return EXIT_COVERAGE_FAIL
+
+
+def _print_written(
+    written: Sequence[tuple[TemplateSpec, dict[str, str | None], LedgerEntry]],
+    *,
+    fan_out: bool,
+    n_charts: int,
+    key: bytes | None,
+    ledger_path: Path,
+) -> None:
+    """One block of paths per exported template, in the order they were written."""
+
+    for template, outputs, entry in written:
+        prefix = f"{template.template_id}: " if fan_out else ""
+        print(f"  {prefix}report:   {outputs['report']}")
+        print(f"  {prefix}receipts: {outputs['receipts']}")
+        print(f"  {prefix}trace:    {outputs['trace']}")
+        if outputs.get("document") is not None:
+            print(f"  {prefix}document: {outputs['document']}")
+        if outputs["charts"] is not None:
+            print(f"  {prefix}charts:   {outputs['charts']} ({n_charts} SVG)")
+        print(f"  {prefix}bundle:   {outputs['bundle']} ({'signed' if key else 'digests-only'})")
+        print(f"  {prefix}ledger:   {ledger_path} (entry {entry.index}, hash {entry.entry_hash})")
+
+
+def _document_payload(check: DocumentCheck) -> dict[str, object]:
+    """A document check as JSON: its verdict, and the narrative grounding it read."""
+
+    return {
+        "checked": check.checked,
+        "ok": check.ok,
+        "detail": check.detail,
+        "grounding": None
+        if check.grounding is None
+        else {
+            "total": check.grounding.total,
+            "bound": len(check.grounding.bound),
+            "unbound": [_span_payload(span) for span in check.grounding.unbound],
+        },
+    }
+
+
+def _refuse_for_document(
+    args: argparse.Namespace,
+    refusal: _DocumentRefused,
+    *,
+    figures: Sequence[Figure],
+    narrative_result: GroundingResult,
+    claims_result: GroundingResult,
+    outputs: object,
+    template_payload: Mapping[str, object],
+    claim_payload: object,
+) -> int:
+    """Refuse the export because ``report.docx`` did not hold, having written nothing.
+
+    This is reached only after the grounding gate, coverage, and sign-off have all
+    passed, so what failed is the document: a character it cannot carry, or a
+    rendering that does not say what ``report.md`` says. Nothing is on disk and
+    nothing is in the ledger, because every template is built and checked before
+    any is written. The exit code is the grounding gate's, because this is that
+    gate applied to the file a funder opens.
+    """
+
+    if args.json:
+        payload = _run_payload(
+            gate_pass=False,
+            figures=figures,
+            narrative_result=narrative_result,
+            claims_result=claims_result,
+            outputs=outputs,
+            ledger=None,
+            approval=None,
+        )
+        payload["templates"] = dict(template_payload)
+        payload["comparative_claims"] = claim_payload
+        payload["document"] = {
+            **_document_payload(refusal.check),
+            "template": refusal.template_id,
+        }
+        _emit_json(payload)
+        return EXIT_GATE_FAIL
+    print(f"\ndocument gate: FAIL — refusing to export {refusal.template_id!r}", file=sys.stderr)
+    print(f"  {refusal.check.detail}", file=sys.stderr)
+    return EXIT_GATE_FAIL
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     spec, _rows, figures, comparison, reconciliation = _compute_all(
         args.config, reproducible=args.reproducible, quiet=args.json
@@ -551,6 +1194,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     raw_drafts = _draft_templates(spec, figures, narrative_drafter)
     raw_gate_pass = raw_claims.ok and all(result.ok for _t, _n, result in raw_drafts)
 
+    # The pre-suppression rows, kept before `_redact_report_structures` overwrites
+    # each row's `direction` with the redaction sentinel. The comparative-claim gate
+    # needs the real direction of a withheld row to report a claim about it as a
+    # disclosure rather than as merely unbound, exactly as `audit_narrative` is given
+    # the pre-suppression figures for the same reason.
+    raw_comparison, raw_reconciliation = comparison, reconciliation
+
     suppressed_figures, suppression = suppress_figures(figures)
     publishable = filter_for_aggregate_only(suppressed_figures)
     comparison, reconciliation = _redact_report_structures(comparison, reconciliation, publishable)
@@ -558,10 +1208,28 @@ def _cmd_run(args: argparse.Namespace) -> int:
     claims_result = ground(_claims_text(comparison, reconciliation, charts), publishable)
     drafts = _draft_templates(spec, publishable, narrative_drafter)
     combined_result = ground(" ".join(narrative for _t, narrative, _r in drafts), publishable)
-    gate_pass = raw_gate_pass and claims_result.ok and all(result.ok for _t, _n, result in drafts)
+    # The comparative-claim gate over the drafted prose: a direction word binds only
+    # to a receipted comparison direction. Scoped to the narratives, which is the one
+    # surface a model writes; a metric's author-written caveat is not drafted and is
+    # not gated here.
+    evidence = _direction_evidence(
+        raw_comparison,
+        raw_reconciliation,
+        (*suppression.suppressed, *suppression.complementary_suppressed),
+    )
+    claim_audits = [
+        (template, audit_claims(narrative, evidence)) for template, narrative, _r in drafts
+    ]
+    gate_pass = (
+        raw_gate_pass
+        and claims_result.ok
+        and all(result.ok for _t, _n, result in drafts)
+        and all(audit.ok for _t, audit in claim_audits)
+    )
     template_payload = {
         template.template_id: _grounding_payload(result) for template, _n, result in drafts
     }
+    claim_payload = {template.template_id: audit_payload(audit) for template, audit in claim_audits}
     empty_outputs = {
         "report": None,
         "receipts": None,
@@ -576,31 +1244,50 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
 
     if not args.json:
-        _print_template_summary(publishable, claims_result, drafts)
-        n_hidden = len(suppression.suppressed) + len(suppression.complementary_suppressed)
-        print(f"suppression policy: applied (threshold {suppression.threshold}; hidden {n_hidden})")
+        _print_run_summary(publishable, claims_result, drafts, claim_audits, suppression)
 
-    if not gate_pass:
-        if args.json:
-            payload = _run_payload(
-                gate_pass=False,
-                figures=publishable,
-                narrative_result=combined_result,
-                claims_result=claims_result,
-                outputs=failed_outputs,
-                ledger=None,
-                approval=None,
-            )
-            payload["templates"] = template_payload
-            _emit_json(payload)
-            return EXIT_GATE_FAIL
-        if not raw_gate_pass:
-            _print_gate_failure(raw_claims, raw_drafts)
-        else:
-            _print_gate_failure(claims_result, drafts)
-        return EXIT_GATE_FAIL
+    refusal = _refuse_for_grounding(
+        args,
+        gate_pass=gate_pass,
+        raw_gate_pass=raw_gate_pass,
+        raw_claims=raw_claims,
+        raw_drafts=raw_drafts,
+        figures=figures,
+        publishable=publishable,
+        claims_result=claims_result,
+        drafts=drafts,
+        combined_result=combined_result,
+        outputs=failed_outputs,
+        template_payload=template_payload,
+        claim_audits=claim_audits,
+        claim_payload=claim_payload,
+    )
+    if refusal is not None:
+        return refusal
 
-    approver = _approver(spec.report.title, combined_result, claims_result, args)
+    # The second half of the claim, and it runs after the grounding gate on
+    # purpose: grounding asks whether every number in the prose traces to a
+    # receipt, coverage asks whether every number the funder required was
+    # published. A run that fails grounding has nothing worth grading for
+    # coverage, and a run that passes both is the only one that may be approved.
+    coverage = _requirement_coverage(spec, publishable)
+    refusal = _refuse_for_coverage(
+        args,
+        coverage,
+        figures=publishable,
+        narrative_result=combined_result,
+        claims_result=claims_result,
+        outputs=failed_outputs,
+        template_payload=template_payload,
+        claim_payload=claim_payload,
+    )
+    if refusal is not None:
+        return refusal
+
+    approved_at = _clock(reproducible=args.reproducible).now_iso()
+    approvals, approver, reason = _export_approval(
+        spec, args, combined_result, claims_result, approved_at=approved_at
+    )
     if approver is None:
         if args.json:
             payload = _run_payload(
@@ -613,27 +1300,41 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 approval=None,
             )
             payload["templates"] = template_payload
+            payload["comparative_claims"] = claim_payload
             _emit_json(payload)
-        print("export aborted: no approver sign-off", file=sys.stderr)
+        print(f"export aborted: {reason}", file=sys.stderr)
         return EXIT_APPROVAL_FAIL
 
     key = _load_key(getattr(args, "sign_key_file", None))
-    approved_at = _clock(reproducible=args.reproducible).now_iso()
-    written, ledger_path, fan_out = _write_template_exports(
-        args,
-        spec,
-        publishable,
-        comparison,
-        reconciliation,
-        charts,
-        claims_result,
-        drafts,
-        approver,
-        approved_at,
-        key,
-        suppression_applied=True,
-        narrative_drafter="bedrock" if narrative_drafter is not None else "deterministic",
-    )
+    try:
+        written, ledger_path, fan_out = _write_template_exports(
+            args,
+            spec,
+            publishable,
+            comparison,
+            reconciliation,
+            charts,
+            claims_result,
+            drafts,
+            approver,
+            approved_at,
+            key,
+            suppression_applied=True,
+            narrative_drafter="bedrock" if narrative_drafter is not None else "deterministic",
+            coverage=coverage,
+            approvals=approvals,
+        )
+    except _DocumentRefused as document_refusal:
+        return _refuse_for_document(
+            args,
+            document_refusal,
+            figures=publishable,
+            narrative_result=combined_result,
+            claims_result=claims_result,
+            outputs=failed_outputs,
+            template_payload=template_payload,
+            claim_payload=claim_payload,
+        )
     if args.json:
         flat_outputs: object = (
             written[0][1]
@@ -651,23 +1352,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
             claims_result=claims_result,
             outputs=flat_outputs,
             ledger=ledgers[0] if not fan_out else {"entries": ledgers},
-            approval={"approved_by": approver, "approved_at": approved_at},
+            approval=_approval_payload(approver, approved_at, approvals),
         )
         payload["templates"] = template_payload
-        _emit_json(payload)
+        payload["comparative_claims"] = claim_payload
+        _emit_json(_with_coverage(payload, coverage))
         return EXIT_OK
 
     print("\ngrounding gate: PASS")
-    print(f"  approved: {approver}")
-    for template, outputs, entry in written:
-        prefix = f"{template.template_id}: " if fan_out else ""
-        print(f"  {prefix}report:   {outputs['report']}")
-        print(f"  {prefix}receipts: {outputs['receipts']}")
-        print(f"  {prefix}trace:    {outputs['trace']}")
-        if outputs["charts"] is not None:
-            print(f"  {prefix}charts:   {outputs['charts']} ({len(charts)} SVG)")
-        print(f"  {prefix}bundle:   {outputs['bundle']} ({'signed' if key else 'digests-only'})")
-        print(f"  {prefix}ledger:   {ledger_path} (entry {entry.index}, hash {entry.entry_hash})")
+    _print_coverage_pass(coverage)
+    _print_approval(approver, approvals)
+    _print_written(written, fan_out=fan_out, n_charts=len(charts), key=key, ledger_path=ledger_path)
     return EXIT_OK
 
 
@@ -700,29 +1395,121 @@ def _suppressed_span_payload(disclosure: SuppressedSpan) -> dict[str, object]:
     }
 
 
+def _candidate_payload(candidate: SpanCandidate) -> dict[str, object]:
+    return {
+        "metric_id": candidate.metric_id,
+        "display": candidate.display,
+        "reason": candidate.reason,
+        "detail": candidate.detail,
+        "distance": candidate.distance,
+        "substitutable": candidate.substitutable,
+    }
+
+
+def _explanation_payload(explanation: Explanation) -> dict[str, object]:
+    return {
+        **_span_payload(explanation.span),
+        "remedy": explanation.remedy,
+        "detail": explanation.detail,
+        "candidates": [_candidate_payload(item) for item in explanation.candidates],
+    }
+
+
+def _print_explanations(explanations: Sequence[Explanation]) -> None:
+    """Render the diagnoses under the verdict lines, never in place of them.
+
+    The verdict is printed first and unchanged by the caller; this only adds
+    lines beneath it. An explanation that printed instead of a failure line
+    would let a reader mistake advice for a result.
+    """
+
+    for explanation in explanations:
+        print(f"  why {explanation.span.text!r} at offset {explanation.span.start}:")
+        print(f"    {explanation.detail}")
+        for candidate in explanation.candidates[1:]:
+            print(f"    also: {candidate.detail}")
+
+
+def _print_audit_refusals(result: AuditResult, claims: ClaimAudit) -> None:
+    """The refusal lines, each naming which gate refused and why.
+
+    Kept apart because they are different findings with different remedies: a
+    disclosed number and a disclosed direction are both recoveries of a withheld
+    cell, while an unbound claim is a sentence nothing receipts.
+    """
+
+    if result.suppressed:
+        print(
+            "\naudit: FAIL — the narrative states a cell suppression withholds",
+            file=sys.stderr,
+        )
+    if claims.disclosed:
+        print(
+            "\naudit: FAIL — the narrative states the direction of a withheld comparison",
+            file=sys.stderr,
+        )
+    elif not claims.ok:
+        print(
+            "\naudit: FAIL — a comparative claim binds to no receipted direction",
+            file=sys.stderr,
+        )
+
+
 def _cmd_audit(args: argparse.Namespace) -> int:
     # The full figure set, not just the narrative metrics: complementary
     # suppression is computed over every figure in the report, so auditing
     # against a subset would leave a cell visible here that `run` redacts.
-    _spec, _rows, figures, _comparison, _reconciliation = _compute_all(
+    _spec, _rows, figures, comparison, reconciliation = _compute_all(
         args.config, reproducible=args.reproducible, quiet=args.json
     )
     publishable, hidden = _publishable_and_hidden(figures)
     narrative = Path(args.narrative).read_text(encoding="utf-8")
+
+    if args.apply_fixes:
+        return _apply_fixes(args, narrative, publishable, hidden)
+
+    # --fixes-out is a request for the diagnoses in file form, so it turns them
+    # on. Without this it wrote a plan built from an empty explanation list: a
+    # file that says "no fixes" about a narrative nobody diagnosed, which reads
+    # exactly like a narrative nothing could be done for.
+    explain = bool(args.explain or args.fixes_out)
     result = audit_narrative(narrative, publishable, hidden)
+    # Explaining is a read of the same canonicalization the verdict came from,
+    # and the verdict is already fixed by the line above. `explain_audit`
+    # returns a copy carrying the diagnoses; `ok` does not read them, so the
+    # exit code below is the same number whether or not `--explain` was given.
+    explained = explain_audit(result, publishable, hidden) if explain else result
+    # The same narrative's comparative claims, against the receipted directions.
+    # `_compute_all` returns the pre-suppression comparison, which is the set this
+    # needs: a claim agreeing with a withheld row is a disclosure, and a redacted
+    # row no longer carries the direction that makes it one.
+    claims = audit_claims(
+        narrative,
+        _direction_evidence(comparison, reconciliation, [figure.metric_id for figure in hidden]),
+    )
+    if args.fixes_out:
+        Path(args.fixes_out).write_text(
+            json.dumps(build_fix_plan(narrative, explained.explanations), indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
 
     if args.json:
-        _emit_json(
-            {
-                "command": "audit",
-                "ok": result.ok,
-                "total": result.total,
-                "bound": len(result.bound),
-                "suppressed": [_suppressed_span_payload(item) for item in result.suppressed],
-                "unbound": [_span_payload(span) for span in result.unbound],
-            }
-        )
-        return EXIT_OK if result.ok else EXIT_VERIFY_FAIL
+        payload: dict[str, object] = {
+            "command": "audit",
+            "ok": result.ok,
+            "total": result.total,
+            "bound": len(result.bound),
+            "suppressed": [_suppressed_span_payload(item) for item in result.suppressed],
+            "unbound": [_span_payload(span) for span in result.unbound],
+            "comparative_claims": audit_payload(claims),
+        }
+        if explain:
+            payload["explanations"] = [
+                _explanation_payload(item) for item in explained.explanations
+            ]
+        _emit_json(payload)
+        return EXIT_OK if result.ok and claims.ok else EXIT_VERIFY_FAIL
 
     print(
         f"numbers: {result.total}, bound: {len(result.bound)}, "
@@ -739,12 +1526,153 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             print(f"    (it is also the published value of {also}; rephrase so the two differ)")
     for span in result.unbound:
         print(f"  unverifiable: {span.text!r} at offset {span.start}")
-    if result.suppressed:
+    _print_explanations(explained.explanations)
+    _print_claim_audit("narrative", claims)
+    if args.fixes_out:
+        print(f"  fix plan: {args.fixes_out}")
+    _print_audit_refusals(result, claims)
+    return EXIT_OK if result.ok and claims.ok else EXIT_VERIFY_FAIL
+
+
+def _apply_fixes(
+    args: argparse.Namespace,
+    narrative: str,
+    publishable: Sequence[Figure],
+    hidden: Sequence[Figure],
+) -> int:
+    """Apply a reviewed fix plan, then re-run the gate over what was written.
+
+    The gate is re-run on the *substituted* text, not on the plan's promises.
+    That is the whole point: a plan is a human's edited proposal, and the only
+    statement this command makes about the result is one the gate made about
+    the bytes now on disk.
+    """
+
+    if not args.fixed_out:
+        # Never in place. The narrative is the author's own file and the
+        # substitution is a proposal; writing over it would destroy the text a
+        # reviewer would compare the result against.
         print(
-            "\naudit: FAIL — the narrative states a cell suppression withholds",
+            "audit: --apply-fixes needs --fixed-out; the narrative is never rewritten in place",
             file=sys.stderr,
         )
+        return EXIT_VERIFY_FAIL
+    plan = json.loads(Path(args.apply_fixes).read_text(encoding="utf-8"))
+    try:
+        fixed = apply_fix_plan(narrative, plan, publishable, hidden)
+    except FixPlanRefused as refusal:
+        if args.json:
+            _emit_json({"command": "audit", "applied": False, "refused": str(refusal)})
+        else:
+            print(f"audit: refused to apply the fix plan — {refusal}", file=sys.stderr)
+        return EXIT_VERIFY_FAIL
+
+    Path(args.fixed_out).write_text(fixed, encoding="utf-8")
+    result = audit_narrative(fixed, publishable, hidden)
+    if args.json:
+        _emit_json(
+            {
+                "command": "audit",
+                "applied": True,
+                "written": args.fixed_out,
+                "ok": result.ok,
+                "total": result.total,
+                "bound": len(result.bound),
+                "suppressed": [_suppressed_span_payload(item) for item in result.suppressed],
+                "unbound": [_span_payload(span) for span in result.unbound],
+            }
+        )
+        return EXIT_OK if result.ok else EXIT_VERIFY_FAIL
+
+    print(f"applied {len(plan.get('fixes', []))} fix(es); wrote {args.fixed_out}")
+    print(
+        f"numbers: {result.total}, bound: {len(result.bound)}, "
+        f"suppressed cells: {len(result.suppressed)}, unbound: {len(result.unbound)}"
+    )
+    for span in result.unbound:
+        print(f"  unverifiable: {span.text!r} at offset {span.start}")
     return EXIT_OK if result.ok else EXIT_VERIFY_FAIL
+
+
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    """Serve the read-only tools on stdin/stdout until the client closes them.
+
+    The figure computation is passed in rather than imported by the server, so
+    ``mcp.py`` holds the transport and four projections and nothing that knows
+    how a spec is loaded. It also means the server answers from exactly the same
+    ``_publishable_and_hidden`` split that ``audit`` uses, rather than from a
+    second one that could come to disagree with it.
+
+    ``--reproducible`` is honored so a client can pin ``computed_at``; the
+    figures are recomputed per call rather than cached, because a cache would
+    answer from data the file no longer holds.
+    """
+
+    from outcome_receipts.mcp import serve
+
+    def resolve(
+        config: str,
+    ) -> tuple[Sequence[Figure], Sequence[Figure], Sequence[DirectionEvidence]]:
+        _spec, _rows, figures, comparison, reconciliation = _compute_all(
+            config, reproducible=args.reproducible, quiet=True
+        )
+        publishable, hidden = _publishable_and_hidden(figures)
+        evidence = _direction_evidence(
+            comparison, reconciliation, [figure.metric_id for figure in hidden]
+        )
+        return publishable, hidden, evidence
+
+    return serve(sys.stdin, sys.stdout, resolve)
+
+
+def _check_payload(check: Check) -> dict[str, object]:
+    """One check, carrying what it is a check *of*.
+
+    ``kind`` is the field that distinguishes a receipt re-derived from the data
+    from a descriptor of the manifest document (``schema_version``, ``hash``)
+    compared against a constant. Without it a consumer counting ``checks`` counts
+    descriptors as receipts, which is what every count below used to do.
+    """
+
+    return {
+        "metric_id": check.metric_id,
+        "ok": check.ok,
+        "detail": check.detail,
+        "kind": check.kind,
+    }
+
+
+def _receipt_counts(result: VerifyResult) -> dict[str, object]:
+    """The receipt-only counts, alongside the totals across every check.
+
+    ``n_ok`` and ``drift`` are unchanged and still span both kinds, so a script
+    reading them keeps working. They are simply not counts of receipts, and were
+    reported as though they were: a four-receipt manifest carrying a
+    ``schema_version`` and a ``hash`` descriptor answered ``n_ok: 6``.
+    """
+
+    return {
+        "n_ok": result.n_ok,
+        "drift": len(result.checks) - result.n_ok,
+        "receipts_checked": len(result.receipt_checks),
+        "receipts_ok": result.n_receipts_ok,
+        "receipts_drift": len(result.failed_receipts),
+        "manifest_checks": len(result.manifest_checks),
+        "manifest_checks_failed": len(result.failed_manifest_checks),
+    }
+
+
+def _warnings_payload(result: VerifyResult) -> list[dict[str, str]]:
+    """What verify reported without failing on, one entry per receipt.
+
+    Always present, as an empty list when there is nothing to report, so a script
+    can tell "no warnings" apart from an older CLI that had no such key. It never
+    enters ``ok`` and never changes the exit code.
+    """
+
+    return [
+        {"metric_id": warning.metric_id, "detail": warning.detail} for warning in result.warnings
+    ]
 
 
 def _verify_payload(result: VerifyResult) -> dict[str, object]:
@@ -754,12 +1682,9 @@ def _verify_payload(result: VerifyResult) -> dict[str, object]:
         "command": "verify",
         "mode": "manifest",
         "ok": result.ok,
-        "checks": [
-            {"metric_id": check.metric_id, "ok": check.ok, "detail": check.detail}
-            for check in result.checks
-        ],
-        "n_ok": result.n_ok,
-        "drift": len(result.checks) - result.n_ok,
+        "checks": [_check_payload(check) for check in result.checks],
+        **_receipt_counts(result),
+        "warnings": _warnings_payload(result),
     }
 
 
@@ -776,12 +1701,9 @@ def _bundle_payload(result: BundleResult) -> dict[str, object]:
         "command": "verify",
         "mode": "bundle",
         "ok": result.ok,
-        "checks": [
-            {"metric_id": check.metric_id, "ok": check.ok, "detail": check.detail}
-            for check in manifest.checks
-        ],
-        "n_ok": manifest.n_ok,
-        "drift": len(manifest.checks) - manifest.n_ok,
+        "checks": [_check_payload(check) for check in manifest.checks],
+        **_receipt_counts(manifest),
+        "warnings": _warnings_payload(manifest),
         "artifacts": [
             {"path": artifact.path, "ok": artifact.ok, "detail": artifact.detail}
             for artifact in result.artifacts
@@ -791,17 +1713,83 @@ def _bundle_payload(result: BundleResult) -> dict[str, object]:
             "bound": len(result.grounding.bound),
             "unbound": [_span_payload(span) for span in result.grounding.unbound],
         },
+        "coverage": {
+            "checked": result.coverage.checked,
+            "ok": result.coverage.ok,
+            "detail": result.coverage.detail,
+        },
+        "approval": {
+            "checked": result.approval.checked,
+            "ok": result.approval.ok,
+            "detail": result.approval.detail,
+        },
+        "document": _document_payload(result.document),
     }
 
 
+def _print_manifest_checks(result: VerifyResult) -> None:
+    """The two counts, each naming what it counted, then every line.
+
+    The receipt count is the manifest's receipts and nothing else. The manifest
+    count is the document's own descriptors, which are compared against a
+    constant rather than re-derived from the data. Reporting one number for both
+    told a reader that a four-receipt manifest had six receipts re-derived.
+    """
+
+    print(
+        f"receipts checked: {len(result.receipt_checks)} "
+        f"(re-derived {result.n_receipts_ok}, drift {len(result.failed_receipts)})"
+    )
+    if result.manifest_checks:
+        names = ", ".join(check.metric_id for check in result.manifest_checks)
+        failed = len(result.failed_manifest_checks)
+        print(
+            f"manifest descriptors checked: {len(result.manifest_checks)} ({names}); failed {failed}"
+        )
+    for check in result.checks:
+        status = "ok" if check.ok else "DRIFT"
+        print(f"  [{status}] {check.metric_id}: {check.detail}")
+    if result.warnings:
+        print(f"warnings: {len(result.warnings)} (reported, not failed on)")
+        for warning in result.warnings:
+            print(f"  [warn] {warning.metric_id}: {warning.detail}")
+
+
+def _verify_failure_reason(result: VerifyResult) -> str:
+    """What actually failed, in the words of the thing that failed.
+
+    The headline used to read "a receipt does not match the data" whenever the
+    result was not ok -- including when every receipt re-derived and the only
+    failure was the manifest declaring a schema version nobody implements. That
+    sent the reader to the data, which was the one place the problem was not.
+    """
+
+    reasons: list[str] = []
+    descriptors = result.failed_manifest_checks
+    if descriptors:
+        names = ", ".join(check.metric_id for check in descriptors)
+        reasons.append(f"the manifest's own {names} descriptor is not one this version accepts")
+    receipts = result.failed_receipts
+    if receipts:
+        count = len(receipts)
+        noun = "receipt" if count == 1 else "receipts"
+        names = ", ".join(check.metric_id for check in receipts)
+        reasons.append(f"{count} {noun} do not match the data ({names})")
+    if not reasons:
+        # Unreachable while `ok` is the conjunction of every check, and stated
+        # rather than silently rendered as an empty reason if that ever changes.
+        return "the manifest did not verify, and no failing check says why"
+    return " and ".join(reasons)
+
+
 def _cmd_verify(args: argparse.Namespace) -> int:
-    _spec, _rows, figures, _comparison, _reconciliation = _compute_all(
+    spec, _rows, figures, _comparison, _reconciliation = _compute_all(
         args.config, reproducible=args.reproducible, quiet=args.json
     )
     # Apply suppression to re-derived figures so they match the exported manifest.
     suppressed_figures, _suppression_result = suppress_figures(figures)
     if args.bundle is not None:
-        return _verify_bundle(args, suppressed_figures)
+        return _verify_bundle(args, spec, suppressed_figures)
     manifest = json.loads(Path(args.receipts).read_text(encoding="utf-8"))
     result = verify_manifest(suppressed_figures, manifest)
 
@@ -809,17 +1797,11 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         _emit_json(_verify_payload(result))
         return EXIT_OK if result.ok else EXIT_VERIFY_FAIL
 
-    print(
-        f"receipts checked: {len(result.checks)} "
-        f"(re-derived {result.n_ok}, drift {len(result.checks) - result.n_ok})"
-    )
-    for check in result.checks:
-        status = "ok" if check.ok else "DRIFT"
-        print(f"  [{status}] {check.metric_id}: {check.detail}")
+    _print_manifest_checks(result)
     if result.ok:
         print("\nverify: PASS — every receipt re-derives from the data")
         return EXIT_OK
-    print("\nverify: FAIL — a receipt does not match the data", file=sys.stderr)
+    print(f"\nverify: FAIL — {_verify_failure_reason(result)}", file=sys.stderr)
     return EXIT_VERIFY_FAIL
 
 
@@ -895,21 +1877,23 @@ def _cmd_verify_ledger(args: argparse.Namespace) -> int:
     return EXIT_VERIFY_FAIL
 
 
-def _verify_bundle(args: argparse.Namespace, figures: Sequence[Figure]) -> int:
-    result = verify_bundle(Path(args.bundle), figures)
+def _verify_bundle(args: argparse.Namespace, spec: Spec, figures: Sequence[Figure]) -> int:
+    # The coverage is re-derived from the spec and the requirement document as
+    # they are *now*, not read back from the manifest, so an edit to the
+    # requirement document after export changes the digest and fails here.
+    result = verify_bundle(
+        Path(args.bundle),
+        figures,
+        coverage=_requirement_coverage(spec, figures),
+        approval_policy=spec.report.approval,
+    )
     manifest = result.manifest
 
     if args.json:
         _emit_json(_bundle_payload(result))
         return EXIT_OK if result.ok else EXIT_VERIFY_FAIL
 
-    print(
-        f"receipts checked: {len(manifest.checks)} "
-        f"(re-derived {manifest.n_ok}, drift {len(manifest.checks) - manifest.n_ok})"
-    )
-    for check in manifest.checks:
-        status = "ok" if check.ok else "DRIFT"
-        print(f"  [{status}] {check.metric_id}: {check.detail}")
+    _print_manifest_checks(manifest)
     print(f"artifacts checked: {len(result.artifacts)}")
     for artifact in result.artifacts:
         status = "ok" if artifact.ok else "MISMATCH"
@@ -920,17 +1904,46 @@ def _verify_bundle(args: argparse.Namespace, figures: Sequence[Figure]) -> int:
     )
     for span in result.grounding.unbound:
         print(f"  unverifiable number: {span.text!r}")
+    print(
+        "requirement coverage: "
+        + ("not checked" if not result.coverage.checked else "checked")
+        + f" — {result.coverage.detail}"
+    )
+    print(
+        "approval policy: "
+        + ("not checked" if not result.approval.checked else "checked")
+        + f" — {result.approval.detail}"
+    )
+    print(
+        "document export: "
+        + ("not checked" if not result.document.checked else "checked")
+        + f" — {result.document.detail}"
+    )
 
     if result.ok:
         print("\nverify: PASS — the whole bundle is coherent")
         return EXIT_OK
+    _print_bundle_failure(result)
+    return EXIT_VERIFY_FAIL
+
+
+def _print_bundle_failure(result: BundleResult) -> None:
+    """Name every check that failed, on stderr, one line each."""
+
     print("\nverify: FAIL — the exported bundle does not verify", file=sys.stderr)
+    if not result.manifest.ok:
+        print(f"  receipts manifest: {_verify_failure_reason(result.manifest)}", file=sys.stderr)
     for artifact in result.failed_artifacts:
         print(f"  offending file: {artifact.path} ({artifact.detail})", file=sys.stderr)
     if not result.grounding.ok:
         for span in result.grounding.unbound:
             print(f"  ungrounded number in report.md: {span.text!r}", file=sys.stderr)
-    return EXIT_VERIFY_FAIL
+    if not result.coverage.ok:
+        print(f"  requirement coverage: {result.coverage.detail}", file=sys.stderr)
+    if not result.approval.ok:
+        print(f"  approval policy: {result.approval.detail}", file=sys.stderr)
+    if not result.document.ok:
+        print(f"  document export: {result.document.detail}", file=sys.stderr)
 
 
 def _eval_payload(report: EvalReport, *, out: str | None) -> dict[str, object]:
@@ -1153,7 +2166,7 @@ def _cmd_restate(args: argparse.Namespace) -> int:
         prior_bundle=Path(args.prior_bundle),
         current_config=Path(args.config),
         reason=args.reason,
-        approved_by=args.approved_by,
+        approved_by=_workflow_approver(args.config, args),
         reproducible=args.reproducible,
     )
     return _finish_workflow(args, artifact)
@@ -1178,10 +2191,44 @@ def _cmd_contract_check(args: argparse.Namespace) -> int:
     artifact = build_contract_evidence(
         config_path=Path(args.config),
         contract_path=Path(args.contract),
-        approved_by=args.approved_by,
+        approved_by=_workflow_approver(args.config, args),
         reproducible=args.reproducible,
     )
     return _finish_workflow(args, artifact)
+
+
+def _cmd_suppress_preview(args: argparse.Namespace) -> int:
+    """Preview policies without writing a report, a bundle, or a ledger entry.
+
+    The raw figures are computed once and every policy is measured against that
+    same set, so a difference between two rows is a difference the policy made
+    rather than a difference in what was computed.
+    """
+    policies: list[SuppressionPolicy] = []
+    seen: set[tuple[str, int]] = set()
+    for policy_id in args.policy or []:
+        policy = get_policy(policy_id)
+        if (policy.policy_id, policy.threshold) not in seen:
+            seen.add((policy.policy_id, policy.threshold))
+            policies.append(policy)
+    for threshold in args.threshold or []:
+        policy = ad_hoc_policy(threshold)
+        if (policy.policy_id, policy.threshold) not in seen:
+            seen.add((policy.policy_id, policy.threshold))
+            policies.append(policy)
+    if not policies:
+        policies.append(get_policy(DEFAULT_POLICY_ID))
+
+    _spec, _rows, figures, _comparison, _reconciliation = _compute_all(
+        args.config, reproducible=args.reproducible, quiet=args.json
+    )
+    previews = preview_policies(figures, policies)
+
+    if args.json:
+        _emit_json(preview_payload(previews, include_withheld_values=args.local))
+        return EXIT_OK
+    print(render_preview_markdown(previews, include_withheld_values=args.local), end="")
+    return EXIT_OK
 
 
 def _cmd_rollup(args: argparse.Namespace) -> int:
@@ -1197,7 +2244,7 @@ def _cmd_equity_review(args: argparse.Namespace) -> int:
     artifact = build_equity_review(
         config_path=Path(args.config),
         plan_path=Path(args.plan),
-        approved_by=args.approved_by,
+        approved_by=_workflow_approver(args.config, args),
         reproducible=args.reproducible,
     )
     return _finish_workflow(args, artifact)
@@ -1230,6 +2277,316 @@ def _cmd_verify_workflow(args: argparse.Namespace) -> int:
         outcome = "PASS" if result.ok else "FAIL"
         print(f"\nverify-workflow: {outcome}")
     return EXIT_OK if result.ok else EXIT_VERIFY_FAIL
+
+
+# --------------------------------------------------------------------------
+# The portfolio: a batch of specs, and the one page an auditor enters through.
+# --------------------------------------------------------------------------
+
+
+def _portfolio_slug(spec: Path) -> str:
+    """The output subdirectory one spec's exports go into.
+
+    A spec is conventionally ``<name>/report.toml``, so the directory name is the
+    identifying half; anything else falls back to the file's own stem.
+    """
+
+    return spec.parent.name if spec.name == "report.toml" else spec.stem
+
+
+def _portfolio_targets(specs: Sequence[str]) -> list[tuple[Path, str]]:
+    """The specs to run, ordered by path, with the slug each writes under.
+
+    Ordering is by resolved path so a batch is deterministic whatever order the
+    arguments arrived in. A repeated spec and two specs that would write into one
+    directory are both refused, naming what collided: silently running a spec
+    twice, or letting the second overwrite the first, would produce an index
+    whose rows do not correspond to the specs the operator asked for.
+    """
+
+    resolved = sorted({Path(spec).resolve() for spec in specs})
+    if len(resolved) != len({Path(spec).resolve() for spec in specs}):  # pragma: no cover
+        raise PortfolioError("duplicate spec")
+    if len(resolved) < len(specs):
+        raise PortfolioError("the same spec was given more than once")
+    targets: list[tuple[Path, str]] = []
+    taken: dict[str, Path] = {}
+    for spec in resolved:
+        slug = _portfolio_slug(spec)
+        if slug in taken:
+            raise PortfolioError(
+                f"{spec} and {taken[slug]} would both export into {slug!r}; "
+                "rename one directory or run them into separate portfolios"
+            )
+        taken[slug] = spec
+        targets.append((spec, slug))
+    return targets
+
+
+def _portfolio_run_argv(
+    args: argparse.Namespace, spec: Path, out_dir: Path, ledger: Path
+) -> list[str]:
+    """The `run` command line one spec in the batch is exported with.
+
+    Built as an argv and parsed by the real parser rather than assembled as a
+    Namespace, so every default comes from `run` itself. A flag added to `run`
+    later cannot silently take a different default inside a batch.
+    """
+
+    argv = [
+        "run",
+        "--config",
+        str(spec),
+        "--out",
+        str(out_dir),
+        "--ledger",
+        str(ledger),
+        "--locale",
+        args.locale,
+    ]
+    if args.reproducible:
+        argv.append("--reproducible")
+    if args.approved_by is not None:
+        argv += ["--approved-by", args.approved_by]
+    for pair in args.approve or []:
+        argv += ["--approve", pair]
+    if args.recipient is not None:
+        argv += ["--recipient", args.recipient]
+    if args.sign_key_file is not None:
+        argv += ["--sign-key-file", args.sign_key_file]
+    return argv
+
+
+def _portfolio_bundles(spec: Spec, out_dir: Path) -> list[tuple[str, Path]]:
+    """The `(title, directory)` pairs one spec's export wrote.
+
+    A multi-template spec writes one bundle per funder format into its own
+    subdirectory, so it contributes several rows to the index rather than one.
+    The index is a list of reports, and each of those is a report.
+    """
+
+    if not spec.report.templates:
+        return [(spec.report.title, out_dir)]
+    return [(template.title, out_dir / template.template_id) for template in spec.report.templates]
+
+
+def _portfolio_report(
+    spec_path: Path,
+    title: str,
+    bundle_dir: Path,
+    root: Path,
+    entry: LedgerEntry,
+) -> PortfolioReport:
+    """One index row, read back from what the export actually wrote."""
+
+    manifest = json.loads((bundle_dir / "receipts.json").read_text(encoding="utf-8"))
+    provenance = manifest.get("provenance", {})
+    approved_by = str(provenance.get("approved_by") or "")
+    bundle = json.loads((bundle_dir / _BUNDLE_NAME).read_text(encoding="utf-8"))
+    return PortfolioReport(
+        spec=str(spec_path),
+        directory=bundle_dir.relative_to(root).as_posix(),
+        title=title,
+        approved_by=approved_by,
+        bundle_digest=str(bundle.get("bundle_digest", "")),
+        signed="signature" in bundle,
+        ledger_index=entry.index,
+        ledger_entry_hash=entry.entry_hash,
+    )
+
+
+def _cmd_portfolio(args: argparse.Namespace) -> int:
+    """Run every spec through the ordinary export path, then record the batch.
+
+    No shortcut: each spec is exported by `run` itself, so the grounding gate,
+    the requirement-coverage refusal, suppression and the human sign-off all
+    apply exactly as they do to a single report. The first spec that does not
+    export stops the batch, names itself, and returns its own exit code, and no
+    portfolio record is written -- an index over a batch that did not finish
+    would say the portfolio is what it is not. The exports that already
+    succeeded stay on disk and stay in the ledger, because they happened.
+    """
+
+    root = Path(args.out)
+    ledger = Path(args.ledger) if args.ledger else root / "export-ledger.jsonl"
+    targets = _portfolio_targets(args.specs)
+    reports: list[PortfolioReport] = []
+    for spec_path, slug in targets:
+        out_dir = root / slug
+        before = len(read_ledger(ledger))
+        argv = _portfolio_run_argv(args, spec_path, out_dir, ledger)
+        run_args = build_parser().parse_args(argv)
+        if args.json:
+            # The batch's own JSON object is the only thing on stdout. Each run's
+            # human output would otherwise interleave with it; stderr is left
+            # alone, so a refusal still says why.
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = int(run_args.func(run_args))
+        else:
+            print(f"\n=== {spec_path} ===")
+            code = int(run_args.func(run_args))
+        if code != EXIT_OK:
+            print(
+                f"\nportfolio: FAIL -- {spec_path} did not export (exit {code}); "
+                "no portfolio record was written",
+                file=sys.stderr,
+            )
+            return code
+        entries = read_ledger(ledger)[before:]
+        bundles = _portfolio_bundles(load_spec(spec_path), out_dir)
+        if len(entries) != len(bundles):  # pragma: no cover - defensive
+            print(
+                f"portfolio: FAIL -- {spec_path} wrote {len(bundles)} bundle(s) but "
+                f"{len(entries)} ledger entr(ies); no portfolio record was written",
+                file=sys.stderr,
+            )
+            return EXIT_VERIFY_FAIL
+        for (title, bundle_dir), entry in zip(bundles, entries, strict=True):
+            reports.append(_portfolio_report(spec_path, title, bundle_dir, root, entry))
+
+    index = PortfolioIndex(
+        reports=tuple(reports), ledger=os.path.relpath(ledger, root).replace(os.sep, "/")
+    )
+    path = write_index(root, index)
+    if args.json:
+        _emit_json(
+            {
+                "command": "portfolio",
+                "out": str(root),
+                "record": str(path),
+                "ledger": str(ledger),
+                "reports": [report.payload() for report in index.reports],
+            }
+        )
+        return EXIT_OK
+    print(f"\nportfolio: {len(reports)} report(s) exported")
+    print(f"  record: {path}")
+    print(f"  ledger: {ledger}")
+    print(f"  next:   receipts portfolio-verify --dir {root}")
+    return EXIT_OK
+
+
+def _verify_one_report(
+    report: PortfolioReport, root: Path, *, reproducible: bool
+) -> tuple[ReportVerification, dict[str, Any] | None]:
+    """Re-verify one report from its own spec, and hand back its manifest.
+
+    The manifest comes back so the shared-figure table is built from what each
+    report actually published rather than from a second computation. A report
+    that cannot be read at all is a failed row, not an aborted run: one broken
+    bundle must not hide the state of the others.
+    """
+
+    bundle_dir = root / report.directory
+    try:
+        spec, _rows, figures, _comparison, _reconciliation = _compute_all(
+            report.spec, reproducible=reproducible, quiet=True
+        )
+        suppressed, _suppression = suppress_figures(figures)
+        result = verify_bundle(
+            bundle_dir,
+            suppressed,
+            coverage=_requirement_coverage(spec, suppressed),
+            approval_policy=spec.report.approval,
+        )
+        bundle = json.loads((bundle_dir / _BUNDLE_NAME).read_text(encoding="utf-8"))
+        manifest = json.loads((bundle_dir / "receipts.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, KeyError, CoverageError, WorkflowError) as exc:
+        return ReportVerification(report, False, f"{type(exc).__name__}: {exc}"), None
+
+    seal = verify_signed_bundle(_bundle_members(bundle_dir), bundle)
+    recorded = str(bundle.get("bundle_digest", ""))
+    problems: list[str] = []
+    if not result.ok:
+        problems.append(_bundle_failure_reason(result))
+    if not seal.ok:
+        problems.append("the sealed bundle manifest does not match the files beside it")
+    if recorded != report.bundle_digest:
+        # Catches a wholesale replacement of bundle.json, which re-seals itself
+        # and would otherwise verify against its own new digest.
+        problems.append(
+            f"bundle digest {recorded or '(absent)'} does not match the "
+            f"{report.bundle_digest} recorded when the batch ran"
+        )
+    if problems:
+        return ReportVerification(report, False, "; ".join(problems)), manifest
+    return ReportVerification(report, True, "every receipt, artifact and seal holds"), manifest
+
+
+def _bundle_failure_reason(result: BundleResult) -> str:
+    """One sentence naming what in a bundle did not hold."""
+
+    reasons: list[str] = []
+    if not result.manifest.ok:
+        reasons.append(_verify_failure_reason(result.manifest))
+    if result.failed_artifacts:
+        reasons.append(
+            "artifact(s) changed after export: "
+            + ", ".join(check.path for check in result.failed_artifacts)
+        )
+    if not result.grounding.ok:
+        reasons.append(f"{len(result.grounding.unbound)} number(s) in report.md no longer bind")
+    if not result.coverage.ok:
+        reasons.append(result.coverage.detail)
+    if not result.approval.ok:
+        reasons.append(result.approval.detail)
+    if not result.document.ok:
+        reasons.append(result.document.detail)
+    return "; ".join(reasons) or "the bundle did not verify and no check says why"
+
+
+def _cmd_portfolio_verify(args: argparse.Namespace) -> int:
+    """Re-verify every bundle in a portfolio and render the auditor's index."""
+
+    root = Path(args.dir)
+    index = read_index(root)
+    verifications: list[ReportVerification] = []
+    manifests: list[tuple[str, dict[str, Any]]] = []
+    for report in index.reports:
+        verification, manifest = _verify_one_report(report, root, reproducible=args.reproducible)
+        verifications.append(verification)
+        if manifest is not None:
+            manifests.append((report.title, manifest))
+
+    shared = shared_figures(manifests)
+    page = root / PAGE_NAME
+    page.write_text(render_index_html(verifications, shared, locale=args.locale), encoding="utf-8")
+    ok = all(verification.ok for verification in verifications)
+
+    if args.json:
+        _emit_json(
+            {
+                "command": "portfolio-verify",
+                "ok": ok,
+                "dir": str(root),
+                "index": str(page),
+                "reports": [
+                    {
+                        "title": verification.report.title,
+                        "directory": verification.report.directory,
+                        "ok": verification.ok,
+                        "detail": verification.detail,
+                    }
+                    for verification in verifications
+                ],
+                "shared_figures": [figure.payload() for figure in shared],
+            }
+        )
+        return EXIT_OK if ok else EXIT_VERIFY_FAIL
+
+    for verification in verifications:
+        status = "ok" if verification.ok else "FAILED"
+        print(f"  [{status}] {verification.report.title}: {verification.detail}")
+    print(f"shared figures: {len(shared)}")
+    for figure in shared:
+        print(f"  {figure.metric_id}: {figure.status}")
+    print(f"index: {page}")
+    if ok:
+        print(f"\nportfolio-verify: PASS -- {len(verifications)} report(s) still verify")
+        return EXIT_OK
+    print("\nportfolio-verify: FAIL -- at least one report no longer verifies", file=sys.stderr)
+    return EXIT_VERIFY_FAIL
 
 
 def _cmd_cards(args: argparse.Namespace) -> int:
@@ -1295,6 +2652,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="language for the report's prose and labels (figures are unchanged)",
     )
     run_parser.add_argument(
+        "--format",
+        dest="document_format",
+        default="md",
+        choices=("md", "docx"),
+        help="md (the default) writes report.md; docx also writes report.docx beside it, "
+        "rendered from report.md and gated again on the document's own bytes",
+    )
+    run_parser.add_argument(
         "--sign-key-file",
         help="path to a key file; adds a keyed-BLAKE2b signature to bundle.json",
     )
@@ -1305,6 +2670,12 @@ def build_parser() -> argparse.ArgumentParser:
         "skips the interactive sign-off prompt",
     )
     run_parser.add_argument(
+        "--approve",
+        action="append",
+        metavar="ROLE:NAME",
+        help="record a sign-off for one role the spec's [approval] policy requires, as ROLE:NAME; repeat once per role",
+    )
+    run_parser.add_argument(
         "--yes",
         "--no-confirm",
         dest="no_confirm",
@@ -1312,7 +2683,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the interactive sign-off prompt; requires --approved-by, "
         "otherwise the export aborts with no approver",
     )
+    run_parser.add_argument(
+        "--explain",
+        action="store_true",
+        help=(
+            "when the gate refuses, say why each number missed and which receipted "
+            "displays are nearest. Advice only; the refusal and the exit code stand"
+        ),
+    )
     run_parser.set_defaults(func=_cmd_run)
+
+    mcp_parser = sub.add_parser(
+        "mcp",
+        help="serve audit, verify, trace and the publishable figures to a drafting "
+        "tool over stdio (read-only: no export, no approval, no network)",
+    )
+    mcp_parser.add_argument("--reproducible", action="store_true", help=argparse.SUPPRESS)
+    mcp_parser.set_defaults(func=_cmd_mcp)
 
     audit_parser = sub.add_parser(
         "audit",
@@ -1321,6 +2708,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audit_parser.add_argument("--config", required=True, help="path to the report spec TOML")
     audit_parser.add_argument("--narrative", required=True, help="narrative text to check")
+    audit_parser.add_argument(
+        "--explain",
+        action="store_true",
+        help=(
+            "diagnose each failing number: the nearest receipted displays and why they "
+            "did not match. Advice only; the verdict and the exit code are unchanged"
+        ),
+    )
+    audit_parser.add_argument(
+        "--fixes-out",
+        help="write a reviewable fix plan (JSON) for the diagnosed spans; implies --explain",
+    )
+    audit_parser.add_argument(
+        "--apply-fixes",
+        help=(
+            "apply a reviewed fix plan, substituting only exact receipted displays, "
+            "then re-run the gate over the result"
+        ),
+    )
+    audit_parser.add_argument(
+        "--fixed-out",
+        help="where to write the fixed narrative; required with --apply-fixes",
+    )
     audit_parser.add_argument("--reproducible", action="store_true", help=argparse.SUPPRESS)
     audit_parser.set_defaults(func=_cmd_audit)
 
@@ -1412,7 +2822,18 @@ def build_parser() -> argparse.ArgumentParser:
     restate_parser.add_argument("--prior-bundle", required=True)
     restate_parser.add_argument("--config", required=True, help="current report spec TOML")
     restate_parser.add_argument("--reason", required=True)
-    restate_parser.add_argument("--approved-by", required=True, metavar="NAME")
+    restate_parser.add_argument(
+        "--approved-by",
+        metavar="NAME",
+        help="record NAME as the single human approver; refused when the spec's "
+        "[approval] policy names roles",
+    )
+    restate_parser.add_argument(
+        "--approve",
+        action="append",
+        metavar="ROLE:NAME",
+        help="record a sign-off for one role the spec's [approval] policy requires, as ROLE:NAME; repeat once per role",
+    )
     restate_parser.add_argument("--out", required=True)
     restate_parser.add_argument("--reproducible", action="store_true")
     restate_parser.set_defaults(func=_cmd_restate)
@@ -1446,10 +2867,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     contract_parser.add_argument("--config", required=True)
     contract_parser.add_argument("--contract", required=True)
-    contract_parser.add_argument("--approved-by", required=True, metavar="NAME")
+    contract_parser.add_argument(
+        "--approved-by",
+        metavar="NAME",
+        help="record NAME as the single human approver; refused when the spec's "
+        "[approval] policy names roles",
+    )
+    contract_parser.add_argument(
+        "--approve",
+        action="append",
+        metavar="ROLE:NAME",
+        help="record a sign-off for one role the spec's [approval] policy requires, as ROLE:NAME; repeat once per role",
+    )
     contract_parser.add_argument("--out", required=True)
     contract_parser.add_argument("--reproducible", action="store_true")
     contract_parser.set_defaults(func=_cmd_contract_check)
+
+    preview_parser = sub.add_parser(
+        "suppress-preview",
+        help="preview what suppression policies would withhold, writing nothing",
+        parents=[json_parent],
+    )
+    preview_parser.add_argument("--config", required=True)
+    preview_parser.add_argument(
+        "--threshold",
+        type=int,
+        action="append",
+        metavar="N",
+        help="an uncited threshold to preview; repeatable",
+    )
+    preview_parser.add_argument(
+        "--policy",
+        action="append",
+        metavar="ID",
+        help="a registered policy id to preview; repeatable",
+    )
+    preview_parser.add_argument(
+        "--local",
+        action="store_true",
+        help="include the withheld values; omit for the shareable profile",
+    )
+    preview_parser.add_argument("--reproducible", action="store_true")
+    preview_parser.set_defaults(func=_cmd_suppress_preview)
 
     rollup_parser = sub.add_parser(
         "rollup",
@@ -1469,7 +2928,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     equity_parser.add_argument("--config", required=True)
     equity_parser.add_argument("--plan", required=True)
-    equity_parser.add_argument("--approved-by", required=True, metavar="NAME")
+    equity_parser.add_argument(
+        "--approved-by",
+        metavar="NAME",
+        help="record NAME as the single human approver; refused when the spec's "
+        "[approval] policy names roles",
+    )
+    equity_parser.add_argument(
+        "--approve",
+        action="append",
+        metavar="ROLE:NAME",
+        help="record a sign-off for one role the spec's [approval] policy requires, as ROLE:NAME; repeat once per role",
+    )
     equity_parser.add_argument("--out", required=True)
     equity_parser.add_argument("--reproducible", action="store_true")
     equity_parser.set_defaults(func=_cmd_equity_review)
@@ -1481,6 +2951,68 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify_workflow_parser.add_argument("--artifact", required=True)
     verify_workflow_parser.set_defaults(func=_cmd_verify_workflow)
+
+    portfolio_parser = sub.add_parser(
+        "portfolio",
+        help="run several report specs through the ordinary export path as one batch",
+        parents=[json_parent],
+    )
+    portfolio_parser.add_argument(
+        "--specs",
+        required=True,
+        nargs="+",
+        metavar="TOML",
+        help="the report specs to export, in any order; the batch runs them by path",
+    )
+    portfolio_parser.add_argument(
+        "--out", required=True, help="the portfolio directory every report writes under"
+    )
+    portfolio_parser.add_argument(
+        "--ledger",
+        default=None,
+        help="the shared append-only export ledger (default: <out>/export-ledger.jsonl)",
+    )
+    portfolio_parser.add_argument(
+        "--approved-by",
+        metavar="NAME",
+        help="record NAME as the human approver of every report in the batch",
+    )
+    portfolio_parser.add_argument(
+        "--approve",
+        action="append",
+        metavar="ROLE:NAME",
+        help="record a sign-off for one role a spec's [approval] policy requires; "
+        "repeat once per role",
+    )
+    portfolio_parser.add_argument(
+        "--recipient",
+        default=None,
+        help="who the reports were exported to, recorded in the shared ledger",
+    )
+    portfolio_parser.add_argument(
+        "--locale", default="en", choices=("en", "es"), help="language for report prose"
+    )
+    portfolio_parser.add_argument(
+        "--sign-key-file", help="path to a key file; signs every bundle in the batch"
+    )
+    portfolio_parser.add_argument("--reproducible", action="store_true", help=argparse.SUPPRESS)
+    portfolio_parser.set_defaults(func=_cmd_portfolio)
+
+    portfolio_verify_parser = sub.add_parser(
+        "portfolio-verify",
+        help="re-verify every bundle in a portfolio and render the auditor's index",
+        parents=[json_parent],
+    )
+    portfolio_verify_parser.add_argument(
+        "--dir", required=True, help="the portfolio directory `receipts portfolio` wrote"
+    )
+    portfolio_verify_parser.add_argument(
+        "--locale", default="en", choices=("en", "es"), help="language for the index page"
+    )
+    portfolio_verify_parser.add_argument(
+        "--reproducible", action="store_true", help=argparse.SUPPRESS
+    )
+    portfolio_verify_parser.set_defaults(func=_cmd_portfolio_verify)
 
     cards_parser = sub.add_parser(
         "cards", help="generate or check the model and data cards", parents=[json_parent]
@@ -1502,6 +3034,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         label = "drafting policy" if isinstance(exc, DraftingPolicyError) else "workflow"
         print(f"{label}: FAIL — {exc}", file=sys.stderr)
         return EXIT_VERIFY_FAIL
+    except CoverageError as exc:
+        # An unusable requirement binding is an authoring defect in the spec or
+        # the requirement document, not a coverage result. It exits on the
+        # coverage code because nothing was exported, and it names what is wrong
+        # rather than reporting zero requirements answered -- which would be a
+        # measurement of a set that was never read.
+        print(f"requirement coverage: FAIL — {exc}", file=sys.stderr)
+        return EXIT_COVERAGE_FAIL
+    except PortfolioError as exc:
+        # An unreadable or contradictory portfolio is a refusal, not an empty
+        # portfolio: a verifier that read no reports has verified nothing, and a
+        # batch whose specs collide has not been run.
+        print(f"portfolio: FAIL -- {exc}", file=sys.stderr)
+        return EXIT_VERIFY_FAIL
+    except ApprovalError as exc:
+        # A sign-off that does not satisfy the spec's policy exits on the
+        # approval code, because nothing was written and the reason is the same
+        # one `run` reports: the export was not approved. `run` handles this
+        # itself so its --json mode still emits exactly one object; the workflow
+        # commands land here.
+        print(f"approval: FAIL — {exc}", file=sys.stderr)
+        return EXIT_APPROVAL_FAIL
+    except UnknownPolicyError as exc:
+        # Fails closed, naming the id. Falling back to the default here would
+        # let a typo silently preview -- and later record -- a different policy
+        # than the one the operator asked for.
+        print(f"suppression policy: FAIL — {exc}", file=sys.stderr)
+        return EXIT_GATE_FAIL
     return result
 
 

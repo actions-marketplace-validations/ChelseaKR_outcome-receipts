@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gettext
 from dataclasses import dataclass
+from html import escape
 
 # nosemgrep: python37-compatibility-importlib2  https://github.com/ChelseaKR/outcome-receipts/issues/53
 from importlib import resources
@@ -35,6 +36,16 @@ class ReportCopy:
     charts_heading: str
     chart_data_caption_template: str
     chart_alt_template: str
+    coverage_heading: str
+    coverage_sentence_template: str
+    coverage_header_requirement: str
+    coverage_header_status: str
+    coverage_header_evidence: str
+    coverage_status_answered: str
+    coverage_status_withheld: str
+    coverage_status_unanswerable: str
+    coverage_status_unanswered: str
+    coverage_no_evidence: str
     receipts_heading: str
     receipt_kind_label: str
     receipt_definition_label: str
@@ -69,6 +80,32 @@ class ReportCopy:
     trace_compared_periods_template: str
     trace_provenance_pass_template: str
     trace_provenance_fail_template: str
+    portfolio_title: str
+    portfolio_intro: str
+    portfolio_summary_template: str
+    portfolio_reports_caption: str
+    portfolio_header_report: str
+    portfolio_header_verification: str
+    portfolio_header_approvers: str
+    portfolio_header_signature: str
+    portfolio_header_bundle_digest: str
+    portfolio_header_ledger: str
+    portfolio_status_verified: str
+    portfolio_status_failed: str
+    portfolio_signature_present: str
+    portfolio_signature_absent: str
+    portfolio_ledger_entry_template: str
+    portfolio_shared_heading: str
+    portfolio_shared_caption: str
+    portfolio_header_agreement: str
+    portfolio_header_stated_by: str
+    portfolio_agreement_agrees: str
+    portfolio_agreement_definition_differs: str
+    portfolio_agreement_value_differs: str
+    portfolio_agreement_not_comparable: str
+    portfolio_definitions_differ_note: str
+    portfolio_no_shared_figures: str
+    docx_chart_note_template: str
 
 
 def _translation(locale: Locale) -> gettext.GNUTranslations:
@@ -102,6 +139,16 @@ def _build_copy(locale: Locale) -> ReportCopy:
         charts_heading=_("charts_heading"),
         chart_data_caption_template=_("chart_data_caption_template"),
         chart_alt_template=_("chart_alt_template"),
+        coverage_heading=_("coverage_heading"),
+        coverage_sentence_template=_("coverage_sentence_template"),
+        coverage_header_requirement=_("coverage_header_requirement"),
+        coverage_header_status=_("coverage_header_status"),
+        coverage_header_evidence=_("coverage_header_evidence"),
+        coverage_status_answered=_("coverage_status_answered"),
+        coverage_status_withheld=_("coverage_status_withheld"),
+        coverage_status_unanswerable=_("coverage_status_unanswerable"),
+        coverage_status_unanswered=_("coverage_status_unanswered"),
+        coverage_no_evidence=_("coverage_no_evidence"),
         receipts_heading=_("receipts_heading"),
         receipt_kind_label=_("receipt_kind_label"),
         receipt_definition_label=_("receipt_definition_label"),
@@ -136,10 +183,96 @@ def _build_copy(locale: Locale) -> ReportCopy:
         trace_compared_periods_template=_("trace_compared_periods_template"),
         trace_provenance_pass_template=_("trace_provenance_pass_template"),
         trace_provenance_fail_template=_("trace_provenance_fail_template"),
+        portfolio_title=_("portfolio_title"),
+        portfolio_intro=_("portfolio_intro"),
+        portfolio_summary_template=_("portfolio_summary_template"),
+        portfolio_reports_caption=_("portfolio_reports_caption"),
+        portfolio_header_report=_("portfolio_header_report"),
+        portfolio_header_verification=_("portfolio_header_verification"),
+        portfolio_header_approvers=_("portfolio_header_approvers"),
+        portfolio_header_signature=_("portfolio_header_signature"),
+        portfolio_header_bundle_digest=_("portfolio_header_bundle_digest"),
+        portfolio_header_ledger=_("portfolio_header_ledger"),
+        portfolio_status_verified=_("portfolio_status_verified"),
+        portfolio_status_failed=_("portfolio_status_failed"),
+        portfolio_signature_present=_("portfolio_signature_present"),
+        portfolio_signature_absent=_("portfolio_signature_absent"),
+        portfolio_ledger_entry_template=_("portfolio_ledger_entry_template"),
+        portfolio_shared_heading=_("portfolio_shared_heading"),
+        portfolio_shared_caption=_("portfolio_shared_caption"),
+        portfolio_header_agreement=_("portfolio_header_agreement"),
+        portfolio_header_stated_by=_("portfolio_header_stated_by"),
+        portfolio_agreement_agrees=_("portfolio_agreement_agrees"),
+        portfolio_agreement_definition_differs=_("portfolio_agreement_definition_differs"),
+        portfolio_agreement_value_differs=_("portfolio_agreement_value_differs"),
+        portfolio_agreement_not_comparable=_("portfolio_agreement_not_comparable"),
+        portfolio_definitions_differ_note=_("portfolio_definitions_differ_note"),
+        portfolio_no_shared_figures=_("portfolio_no_shared_figures"),
+        docx_chart_note_template=_("docx_chart_note_template"),
     )
 
 
 STRINGS: dict[Locale, ReportCopy] = {locale: _build_copy(locale) for locale in SUPPORTED_LOCALES}
+
+
+#: Locales whose fixed copy is machine-translated and has had no human review. Owner decision,
+#: 2026-09-18: the Spanish ships, labeled as such, rather than waiting for the review
+#: docs/I18N.md asks for. Every artifact rendered in one of these locales carries
+#: ``MACHINE_TRANSLATION_NOTICE`` near its top, in both languages.
+MACHINE_TRANSLATED_LOCALES: frozenset[Locale] = frozenset({"es"})
+
+#: The notice, as (lead, body) per language. Deliberately not a gettext message: it must read the
+#: same in both languages whichever catalog rendered the artifact, and a translatable string is
+#: one a later translation could turn into a claim that the copy was reviewed. It sits in the
+#: report's narrative region, which the grounding gate reads, so it holds no digit and no
+#: written-out numeral in either language ("una", "one" and "first" are all refused there).
+MACHINE_TRANSLATION_NOTICE: dict[Locale, tuple[str, str]] = {
+    "es": (
+        "Traducción automática, sin revisión humana.",
+        "Los encabezados, las etiquetas y los avisos fijos de este documento se tradujeron "
+        "automáticamente y ninguna persona los ha revisado. El texto redactado por la "
+        "organización no se tradujo. La versión en inglés es la de referencia: pídala a quien "
+        "preparó este documento.",
+    ),
+    "en": (
+        "Machine-translated, not reviewed by a person.",
+        "This document's fixed headings, labels and notices were translated by machine, and no "
+        "person has reviewed them. The text the organization wrote was not translated. The "
+        "English version is the reference: ask whoever prepared this document for it.",
+    ),
+}
+
+
+def is_machine_translated(locale: str) -> bool:
+    """Whether artifacts in ``locale`` carry the machine-translation notice."""
+
+    return normalize_locale(locale) in MACHINE_TRANSLATED_LOCALES
+
+
+def machine_translation_notice_markdown(locale: str) -> str | None:
+    """The notice as two Markdown paragraphs (Spanish, then English), or ``None`` for English."""
+
+    if not is_machine_translated(locale):
+        return None
+    return "\n\n".join(
+        f"**{lead}** {body}"
+        for lead, body in (MACHINE_TRANSLATION_NOTICE["es"], MACHINE_TRANSLATION_NOTICE["en"])
+    )
+
+
+def machine_translation_notice_html(locale: str) -> str | None:
+    """The notice as an HTML block, each half under its own ``lang``, or ``None`` for English."""
+
+    if not is_machine_translated(locale):
+        return None
+    paragraphs = "".join(
+        f'<p lang="{lang}"><strong>{escape(lead)}</strong> {escape(body)}</p>'
+        for lang, (lead, body) in (
+            ("es", MACHINE_TRANSLATION_NOTICE["es"]),
+            ("en", MACHINE_TRANSLATION_NOTICE["en"]),
+        )
+    )
+    return f'<div class="mt-notice" role="note" data-machine-translation-notice>{paragraphs}</div>'
 
 
 def normalize_locale(locale: str = DEFAULT_LOCALE) -> Locale:

@@ -11,11 +11,14 @@ from pathlib import Path
 
 import pytest
 from scripts.check_conformance import (
+    DEPENDENCY_ADVISORY_KINDS,
     FALLBACK_STANDARDS,
+    VALID_KINDS,
     StandardsIndexError,
     _readme_standards_rows,
     _standards_table_failures,
     action_default_failures,
+    ai_dev_measurement_failures,
     benchmark_claim_failures,
     doc_staleness_failures,
     perf_claim_failures,
@@ -24,6 +27,7 @@ from scripts.check_conformance import (
     standards_index,
     waiver_failures,
 )
+from scripts.check_npm_audit import KIND as NPM_AUDIT_KIND
 
 # A frozen, verbatim copy of the 15 standard-registry lines from the portfolio
 # standards repo's controls.yml. This is what a real `--standards-dir` checkout
@@ -613,6 +617,62 @@ def test_security_declaration_ignores_an_expired_dependency_waiver() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The two waiver linters have to agree on what a waiver may be. They did not.
+# `scripts/check_npm_audit.py` accepts a Node dependency advisory only from a
+# waiver whose kind is exactly its `KIND`; `VALID_KINDS` here did not list that
+# string, so the only kind the npm gate could honor was one this gate rejected.
+# A registry holding the fixture above -- the one four §F tests are written
+# against -- failed `waiver_failures` with "unknown kind", which means the
+# `npm-audit` arm of DEPENDENCY_ADVISORY_KINDS could never fire against a
+# registry this repository would accept. Nothing caught it because WVR-007, the
+# only npm-audit waiver ever granted here, was retired on 2026-08-15 and
+# VALID_KINDS was introduced on 2026-08-21.
+# ---------------------------------------------------------------------------
+
+
+def test_valid_kinds_contains_the_kind_the_npm_audit_gate_requires() -> None:
+    # Read from check_npm_audit rather than restated, so the two constants
+    # cannot drift apart again without this failing.
+    assert NPM_AUDIT_KIND in VALID_KINDS, (
+        f"scripts/check_npm_audit.py accepts a dependency advisory only from a "
+        f"{NPM_AUDIT_KIND!r} waiver, but the waiver lint rejects that kind, so "
+        "no npm-audit waiver can ever be valid in this repository"
+    )
+
+
+def test_every_dependency_advisory_kind_is_a_kind_the_waiver_lint_accepts() -> None:
+    # security_declaration_failures branches on these kinds. A kind the schema
+    # check rejects makes its branch unreachable for the real waivers.yml.
+    unusable = [kind for kind in DEPENDENCY_ADVISORY_KINDS if kind not in VALID_KINDS]
+    assert unusable == [], (
+        f"{unusable} drive the §F VEX cross-check but are rejected by the waiver "
+        "schema check, so that arm can never fire against the committed registry"
+    )
+
+
+def test_the_npm_audit_fixture_registry_is_one_the_waiver_lint_accepts(tmp_path: Path) -> None:
+    # The same text four §F tests are written against, put through the sibling
+    # gate that runs on the same file in the same `make hygiene` invocation.
+    registry = tmp_path / "waivers.yml"
+    registry.write_text(_waivers_with_live_npm_audit_waiver(), encoding="utf-8")
+
+    assert waiver_failures(registry) == []
+
+
+def test_the_waiver_lint_still_rejects_a_near_miss_of_the_local_kind(tmp_path: Path) -> None:
+    # Accepting `npm-audit` must not have turned the kind check into a rubber
+    # stamp: an underscore instead of a hyphen is still an unknown kind, and
+    # check_npm_audit.py would not honor it either.
+    registry = tmp_path / "waivers.yml"
+    registry.write_text(
+        _waivers_with_live_npm_audit_waiver().replace("kind: npm-audit", "kind: npm_audit"),
+        encoding="utf-8",
+    )
+
+    assert any("unknown kind 'npm_audit'" in failure for failure in waiver_failures(registry))
+
+
+# ---------------------------------------------------------------------------
 # Issue 93/DOC-15: this repository's own `Last verified:` stamps were never
 # mechanically checked -- the portfolio's own staleness parser only scans the
 # vendored `.standards` checkout -- and all fourteen used a `Recheck:` label
@@ -673,6 +733,81 @@ def test_doc_staleness_fails_closed_on_an_unparseable_cadence(tmp_path: Path) ->
 
     failures = doc_staleness_failures(tmp_path, date(2026, 8, 21))
     assert any("names no recognized interval" in f for f in failures)
+
+
+def test_doc_staleness_refuses_a_stamp_dated_in_the_future(tmp_path: Path) -> None:
+    """A negative age satisfies `age > max_days` for as long as the file exists.
+
+    So the single edit that most obviously fakes currency -- typing tomorrow's
+    date into the footer -- was the one edit this gate could never report, and
+    it would have kept passing every day after that, forever. The literal here
+    is a full year ahead of the judged date so the assertion cannot be read as
+    an off-by-one about "today".
+    """
+
+    _doc(
+        tmp_path,
+        "docs/tomorrow.md",
+        "*Last verified: 2027-08-21 · Recheck cadence: monthly*",
+    )
+
+    failures = doc_staleness_failures(tmp_path, date(2026, 8, 21))
+    assert failures == [
+        "docs/tomorrow.md: 'Last verified: 2027-08-21' is 365d in the future, "
+        "so no verification it records has happened yet"
+    ]
+
+
+def test_doc_staleness_refuses_a_stamp_one_day_in_the_future(tmp_path: Path) -> None:
+    """The boundary, stated separately: today is fresh, tomorrow is not."""
+
+    _doc(tmp_path, "docs/today.md", "*Last verified: 2026-08-21 · Recheck cadence: monthly*")
+    assert doc_staleness_failures(tmp_path, date(2026, 8, 21)) == []
+
+    _doc(tmp_path, "docs/today.md", "*Last verified: 2026-08-22 · Recheck cadence: monthly*")
+    failures = doc_staleness_failures(tmp_path, date(2026, 8, 21))
+    assert any("is 1d in the future" in f for f in failures)
+
+
+def test_doc_staleness_refuses_a_date_shaped_stamp_that_is_not_a_date(tmp_path: Path) -> None:
+    """`LAST_VERIFIED_RE` matches a shape, not a date.
+
+    `2026-13-40` satisfies it and raised out of `date.fromisoformat`, aborting
+    the whole conformance run on a traceback -- so one typo in one footer
+    suppressed every other conformance failure in the same run. The same defect
+    was already found and fixed once in this repository, in the BASELINE
+    graduation check (`docs/PR-TRIAGE.md`).
+    """
+
+    _doc(
+        tmp_path,
+        "docs/typo.md",
+        "*Last verified: 2026-13-40 · Recheck cadence: quarterly*",
+    )
+
+    failures = doc_staleness_failures(tmp_path, date(2026, 8, 21))
+    assert failures == [
+        "docs/typo.md: 'Last verified: 2026-13-40' is date-shaped but is not a date, "
+        "so this document's currency cannot be measured at all"
+    ]
+
+
+def test_one_unmeasurable_stamp_does_not_hide_a_stale_one(tmp_path: Path) -> None:
+    """The consequence of the traceback, stated as a test.
+
+    A malformed stamp used to end the scan, so whichever documents came after
+    it in the walk went ungraded and the run reported none of them.
+    """
+
+    _doc(tmp_path, "docs/a-typo.md", "*Last verified: 2026-13-40 · Recheck cadence: quarterly*")
+    _doc(tmp_path, "docs/b-stale.md", "*Last verified: 2026-01-01 · Recheck cadence: monthly*")
+    _doc(tmp_path, "docs/c-future.md", "*Last verified: 2027-08-21 · Recheck cadence: monthly*")
+
+    failures = doc_staleness_failures(tmp_path, date(2026, 8, 21))
+    assert len(failures) == 3
+    assert any("a-typo.md" in f and "is not a date" in f for f in failures)
+    assert any("b-stale.md" in f and "stale" in f for f in failures)
+    assert any("c-future.md" in f and "in the future" in f for f in failures)
 
 
 def test_doc_staleness_reads_a_keyword_on_the_first_wrapped_line(tmp_path: Path) -> None:
@@ -985,7 +1120,7 @@ def _perf_fixture(
 
 
 def test_perf_claim_failures_catches_a_figure_that_drifted_from_the_baseline() -> None:
-    # The row is labelled AUTO, which says a gate checks it. Before this check,
+    # The row is labeled AUTO, which says a gate checks it. Before this check,
     # the ROADMAP could publish 0.42 while perf/baseline.json recorded 1.0 and
     # every gate stayed green.
     root = Path(tempfile.mkdtemp())
@@ -1055,3 +1190,134 @@ def test_the_perf_readme_currency_stamp_is_actually_read() -> None:
     assert (root / "perf" / "README.md").exists()
     stale = doc_staleness_failures(root, date(2099, 1, 1))
     assert any("perf/README.md" in failure for failure in stale)
+
+
+# --- The AI-Development Measurement scope line and its BASELINE graduation dates. ---
+
+
+def _roadmap(body: str) -> Path:
+    root = Path(tempfile.mkdtemp())
+    (root / "docs").mkdir(parents=True, exist_ok=True)
+    (root / "docs" / "ROADMAP.md").write_text(body, encoding="utf-8")
+    return root
+
+
+_TODAY = date(2026, 9, 1)
+
+
+def test_ai_dev_measurement_flags_a_missing_scope_declaration() -> None:
+    # The state main was in: the ledger held the delivery numbers but never said
+    # whether the standard applies here, so nobody could tell an unmeasured
+    # repository from an undeclared one.
+    root = _roadmap("| Branch coverage | 90% | AUTO |\n")
+
+    failures = ai_dev_measurement_failures(root, _TODAY)
+
+    assert len(failures) == 1
+    assert "carries no 'AI-DEV-MEASUREMENT: APPLIES'" in failures[0]
+
+
+def test_ai_dev_measurement_flags_a_baseline_row_with_no_graduation_date() -> None:
+    # A metric parked in BASELINE with no date is one nobody has committed to
+    # ever decide about, which the standard treats exactly as an aspirational row.
+    root = _roadmap(
+        "AI-DEV-MEASUREMENT: APPLIES\n"
+        "| Change lead time | 149.8 hours median | BASELINE |\n"
+        "| Churn ratio | 0.074 | BASELINE until 2026-10-11 |\n"
+    )
+
+    failures = ai_dev_measurement_failures(root, _TODAY)
+
+    assert len(failures) == 1
+    assert "'Change lead time'" in failures[0]
+    assert "no graduation date" in failures[0]
+
+
+def test_a_measurement_date_elsewhere_in_the_row_is_not_a_graduation_date() -> None:
+    # The first bug this check shipped with. Every row in the real ledger states
+    # the date its number was measured, so a row-wide date search finds one on
+    # every row and the undated-BASELINE arm could never fire against the
+    # document it exists to read. The date has to come out of the gate cell.
+    root = _roadmap(
+        "AI-DEV-MEASUREMENT: APPLIES\n"
+        "| Change lead time | 149.8 hours median, collected 2026-07-11 | BASELINE |\n"
+    )
+
+    failures = ai_dev_measurement_failures(root, _TODAY)
+
+    assert len(failures) == 1
+    assert "'Change lead time'" in failures[0]
+    assert "no graduation date" in failures[0]
+
+
+def test_a_graduation_date_that_has_passed_is_a_failure() -> None:
+    # The second bug, and the one that made this a check that stops being able
+    # to fail. Asking only whether a date is present means every dated row goes
+    # permanently green the day after the date it printed, which is the metric
+    # sitting in BASELINE indefinitely -- the exact condition the undated arm's
+    # own failure message says must not be possible.
+    root = _roadmap(
+        "AI-DEV-MEASUREMENT: APPLIES\n| Churn ratio | 0.074 | BASELINE until 2026-10-11 |\n"
+    )
+
+    assert ai_dev_measurement_failures(root, date(2026, 10, 11)) == []
+
+    overdue = ai_dev_measurement_failures(root, date(2026, 10, 12))
+    assert len(overdue) == 1
+    assert "'Churn ratio'" in overdue[0]
+    assert "passed on 2026-10-12" in overdue[0]
+
+
+def test_an_unreadable_graduation_date_fails_rather_than_passing() -> None:
+    # A date-shaped string that is not a date is not evidence the decision is
+    # scheduled; it is a claim this check cannot read.
+    root = _roadmap(
+        "AI-DEV-MEASUREMENT: APPLIES\n| Churn ratio | 0.074 | BASELINE until 2026-13-40 |\n"
+    )
+
+    failures = ai_dev_measurement_failures(root, _TODAY)
+
+    assert len(failures) == 1
+    assert "not a real date" in failures[0]
+
+
+def test_ai_dev_measurement_accepts_a_declared_na() -> None:
+    root = _roadmap("AI-DEV-MEASUREMENT: N/A - no AI tooling participates here, 2026-08-27\n")
+
+    assert ai_dev_measurement_failures(root, _TODAY) == []
+
+
+def test_ai_dev_measurement_fails_closed_without_a_roadmap() -> None:
+    assert ai_dev_measurement_failures(Path(tempfile.mkdtemp()), _TODAY) == [
+        "docs/ROADMAP.md is missing, so the AI-DEV-MEASUREMENT scope cannot be checked"
+    ]
+
+
+def test_ai_dev_measurement_is_silent_against_the_real_committed_roadmap() -> None:
+    # The one that would have been red on main. Pinned to a fixed day rather
+    # than date.today(), so this asserts the ledger is conformant rather than
+    # quietly turning into a countdown to 2026-10-11; the gate itself runs on
+    # the real date, which is where the countdown belongs.
+    root = Path(__file__).resolve().parents[1]
+    assert ai_dev_measurement_failures(root, _TODAY) == []
+
+
+def test_every_baseline_row_in_the_real_roadmap_will_fail_once_its_date_passes() -> None:
+    # The real ledger read through the real check: on 2026-10-12 every row that
+    # is parked in BASELINE today reports overdue. Without this, "the gate can
+    # fail" would be a claim about a fixture rather than about the document.
+    root = Path(__file__).resolve().parents[1]
+    roadmap = (root / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
+    parked = [
+        line
+        for line in roadmap.splitlines()
+        if line.startswith("|")
+        and line.rstrip().endswith("|")
+        and "BASELINE" in line.split("|")[-2]
+    ]
+    assert parked, "the ledger records no BASELINE rows, so this test proves nothing"
+
+    overdue = ai_dev_measurement_failures(root, date(2026, 10, 12))
+
+    assert len(overdue) == len(parked)
+    assert all("passed on 2026-10-12" in failure for failure in overdue)

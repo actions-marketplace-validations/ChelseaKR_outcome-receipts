@@ -218,8 +218,38 @@ def doc_staleness_failures(root: Path, today: date) -> list[str]:
                 "mechanically checkable instead of unverifiable prose"
             )
             continue
-        verified = date.fromisoformat(verified_match.group(1))
+        stamp = verified_match.group(1)
+        # `LAST_VERIFIED_RE` matches a date *shape*, not a date. `2026-13-40`
+        # satisfies `\d{4}-\d{2}-\d{2}` and raises out of `date.fromisoformat`,
+        # which used to abort the whole conformance run on a traceback -- so one
+        # typo in one footer suppressed every other conformance failure in the
+        # same run, and the message a reader got named neither the file nor the
+        # stamp. This repository has already learned this exact lesson once:
+        # `docs/PR-TRIAGE.md` records the BASELINE graduation check reading
+        # `2026-13-40` as "a date is present" and passing, and it now fails
+        # closed. Same defect, second checker.
+        try:
+            verified = date.fromisoformat(stamp)
+        except ValueError:
+            failures.append(
+                f"{rel}: 'Last verified: {stamp}' is date-shaped but is not a date, "
+                "so this document's currency cannot be measured at all"
+            )
+            continue
         age = (today - verified).days
+        # An age check needs three outcomes, not two: fresh, stale, and
+        # unmeasurable. A stamp dated in the future gives a *negative* age,
+        # which satisfies `age > max_days` for as long as the file exists --
+        # so the single edit that most obviously fakes currency is the one
+        # edit this gate could never report. A future timestamp is not fresh
+        # data; it is a wrong clock or a wrong entry, and either way nobody
+        # verified this document on a day that has not happened.
+        if age < 0:
+            failures.append(
+                f"{rel}: 'Last verified: {verified.isoformat()}' is {-age}d in the future, "
+                "so no verification it records has happened yet"
+            )
+            continue
         if age > max_days:
             failures.append(
                 f"{rel}: stale -- last verified {verified.isoformat()} ({age}d ago), "
@@ -395,7 +425,22 @@ def _waiver_date(
 #: The portfolio waiver schema's allowed `kind` values (WAIVERS-SCHEMA.md),
 #: mirrored from the portfolio-wide lint's VALID_KINDS so the two cannot
 #: silently diverge on what a waiver is allowed to claim to be.
-VALID_KINDS = ("semgrep", "vex", "pa11y", "na-in-flight", "other")
+PORTFOLIO_KINDS = ("semgrep", "vex", "pa11y", "na-in-flight", "other")
+
+#: This repository's own additional kind. `scripts/check_npm_audit.py` accepts a
+#: Node dependency advisory only from a waiver whose `kind` is exactly its
+#: `KIND` constant, and that string is not one the portfolio schema registers.
+#: Leaving it out of the allowed set made the two linters contradict each other:
+#: the only kind the npm gate can honor was a kind this one rejected, so the
+#: registry could never hold a usable npm-audit waiver, and the `npm-audit` arm
+#: of `DEPENDENCY_ADVISORY_KINDS` below could never fire against the real file.
+#: WVR-007, retired 2026-08-15, was the last such waiver; VALID_KINDS arrived
+#: 2026-08-21, so nothing had exercised the combination since.
+#: `test_valid_kinds_contains_the_kind_the_npm_audit_gate_requires` keeps this
+#: tied to `check_npm_audit.KIND` rather than to a second copy of the string.
+LOCAL_KINDS = ("npm-audit",)
+
+VALID_KINDS = PORTFOLIO_KINDS + LOCAL_KINDS
 
 #: WAIVERS-SCHEMA.md's waiver-id shape.
 WAIVER_ID_RE = re.compile(r"^WVR-\d{3,}$")
@@ -827,7 +872,7 @@ def perf_claim_failures(root: Path) -> list[str]:
     """Check the performance figures docs/ROADMAP.md publishes against perf/baseline.json.
 
     Fails closed on a claim it cannot read as well as on one that is wrong. A row
-    labelled AUTO states that something checks it; before this, nothing did.
+    labeled AUTO states that something checks it; before this, nothing did.
     """
 
     baseline_path = root / "perf" / "baseline.json"
@@ -839,8 +884,10 @@ def perf_claim_failures(root: Path) -> list[str]:
     try:
         metrics = json.loads(baseline_path.read_text(encoding="utf-8"))["metrics"]
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        return [f"perf/baseline.json cannot be read as a metrics object ({exc}), so the "
-                "performance figures docs/ROADMAP.md publishes cannot be checked"]
+        return [
+            f"perf/baseline.json cannot be read as a metrics object ({exc}), so the "
+            "performance figures docs/ROADMAP.md publishes cannot be checked"
+        ]
 
     roadmap = (root / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
     failures: list[str] = []
@@ -983,6 +1030,79 @@ def schema_version_failures(root: Path) -> list[str]:
     return failures
 
 
+# The AI-Development Measurement standard asks each repository for two things a
+# document can hold and a check can read: one scope-declaration line in the
+# ROADMAP metrics ledger, and a graduation date on every metric parked in the
+# BASELINE state. A BASELINE row with no date is a metric nobody has committed to
+# ever decide about, which the standard calls a conformance failure for the same
+# reason an aspirational row is one.
+#
+# Both halves of the date rule are load-bearing, and getting either wrong turns
+# this into the shape of check it exists to catch. The date is read out of the
+# BASELINE cell alone, not out of the row, because every row in this ledger also
+# carries a measurement date: a row-wide search reports a graduation date on a
+# row that names none. And the date is compared against today, because a check
+# that only asks whether a date is *present* goes permanently green on the day
+# after the one it printed -- the metric parked in BASELINE forever, which is
+# exactly the state the failure message below says must not be possible.
+_AI_DEV_DECLARATION_RE = re.compile(r"AI-DEV-MEASUREMENT:\s*(APPLIES|N/A\b)")
+_TABLE_ROW_RE = re.compile(r"^\|.*\|\s*$", re.MULTILINE)
+_ISO_DATE_RE = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})")
+
+
+def _row_cells(row: str) -> list[str]:
+    """The cells of a Markdown table row, without the leading/trailing empties."""
+
+    return [cell.strip() for cell in row.strip().strip("|").split("|")]
+
+
+def ai_dev_measurement_failures(root: Path, today: date) -> list[str]:
+    """Check the measurement standard's two document-level obligations."""
+
+    roadmap_path = root / "docs" / "ROADMAP.md"
+    if not roadmap_path.exists():
+        return ["docs/ROADMAP.md is missing, so the AI-DEV-MEASUREMENT scope cannot be checked"]
+    roadmap = roadmap_path.read_text(encoding="utf-8")
+
+    failures: list[str] = []
+    if _AI_DEV_DECLARATION_RE.search(roadmap) is None:
+        failures.append(
+            "docs/ROADMAP.md carries no 'AI-DEV-MEASUREMENT: APPLIES' or "
+            "'AI-DEV-MEASUREMENT: N/A' scope line in its metrics ledger"
+        )
+    for row in _TABLE_ROW_RE.findall(roadmap):
+        cells = _row_cells(row)
+        if len(cells) < 2:
+            continue
+        gate = cells[-1]
+        if not re.search(r"\bBASELINE\b", gate):
+            continue
+        name = cells[0]
+        match = _ISO_DATE_RE.search(gate)
+        if match is None:
+            failures.append(
+                f"docs/ROADMAP.md parks {name!r} in BASELINE with no graduation date; a metric "
+                "may not sit there indefinitely, so the gate cell must name the date its "
+                "decision is due (YYYY-MM-DD)"
+            )
+            continue
+        try:
+            graduation = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            failures.append(
+                f"docs/ROADMAP.md gives {name!r} the graduation date {match.group(0)!r}, which is "
+                "not a real date, so the date its decision is due cannot be read"
+            )
+            continue
+        if graduation < today:
+            failures.append(
+                f"docs/ROADMAP.md parks {name!r} in BASELINE until {graduation.isoformat()}, "
+                f"which passed on {today.isoformat()}; the metric must now become an AUTO or "
+                "REVIEW gate, be retired, or be re-dated with the decision recorded"
+            )
+    return failures
+
+
 def main() -> int:
     """Return nonzero when a required declaration or artifact is missing."""
 
@@ -1033,6 +1153,7 @@ def main() -> int:
     failures.extend(perf_claim_failures(ROOT))
     failures.extend(action_default_failures(ROOT))
     failures.extend(schema_version_failures(ROOT))
+    failures.extend(ai_dev_measurement_failures(ROOT, date.today()))
 
     if failures:
         print("repository conformance failed:", file=sys.stderr)

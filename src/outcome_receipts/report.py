@@ -13,7 +13,13 @@ from typing import Any
 
 from outcome_receipts.charts import Chart
 from outcome_receipts.comparison import ComparisonResult, ReconciliationResult
-from outcome_receipts.copy import Locale, get_copy
+from outcome_receipts.copy import Locale, get_copy, machine_translation_notice_markdown
+from outcome_receipts.coverage import (
+    STATUS_ANSWERED,
+    STATUS_UNANSWERABLE,
+    STATUS_WITHHELD,
+    RequirementCoverage,
+)
 from outcome_receipts.diff import FigureDelta, ManifestDiff
 from outcome_receipts.evaluate import EvalReport
 from outcome_receipts.models import (
@@ -267,6 +273,54 @@ def _receipt_lines(figure: Figure, *, locale: Locale = "en") -> list[str]:
     return lines
 
 
+def render_requirement_coverage(coverage: RequirementCoverage, *, locale: Locale = "en") -> str:
+    """Render the requirement coverage table for the report appendix.
+
+    Every requirement in the bound document appears, including the ones no
+    metric answers. That is the point: a requirement nobody could answer and a
+    requirement nobody was asked about used to render identically -- as nothing
+    on the page. Telling the funder what was not answered is the honest choice
+    and the one an operator will resist.
+
+    An `unanswered` requirement never reaches this renderer, because export
+    refuses before anything is written. It is in the status vocabulary here only
+    so a coverage record read back from a manifest renders completely.
+    """
+
+    copy = get_copy(locale)
+    labels = {
+        STATUS_ANSWERED: copy.coverage_status_answered,
+        STATUS_WITHHELD: copy.coverage_status_withheld,
+        STATUS_UNANSWERABLE: copy.coverage_status_unanswerable,
+    }
+    counts = coverage.counts()
+    lines = [
+        copy.coverage_heading,
+        "",
+        copy.coverage_sentence_template.format(
+            total=len(coverage.records),
+            answered=counts[STATUS_ANSWERED],
+            withheld=counts[STATUS_WITHHELD],
+            unanswerable=counts[STATUS_UNANSWERABLE],
+            document=coverage.document_path,
+        ),
+        "",
+        f"| {copy.coverage_header_requirement} | {copy.coverage_header_status} "
+        f"| {copy.coverage_header_evidence} |",
+        "| --- | --- | --- |",
+    ]
+    for record in coverage.records:
+        if record.status == STATUS_UNANSWERABLE:
+            evidence = f"{record.reason} ({record.blocker})"
+        elif record.metric_id is not None:
+            evidence = f"`{record.metric_id}`"
+        else:
+            evidence = copy.coverage_no_evidence
+        label = labels.get(record.status, copy.coverage_status_unanswered)
+        lines.append(f"| {record.requirement_id} — {record.description} | {label} | {evidence} |")
+    return "\n".join(lines)
+
+
 def render_report(
     title: str,
     narrative: str,
@@ -277,6 +331,7 @@ def render_report(
     charts: Sequence[Chart] = (),
     chart_dir: str = "charts",
     provenance: Provenance | None = None,
+    coverage: RequirementCoverage | None = None,
     locale: Locale = "en",
 ) -> str:
     """Render the narrative, optional comparison, reconciliation, and charts, then
@@ -293,13 +348,19 @@ def render_report(
     """
 
     copy = get_copy(locale)
-    lines = [f"# {title}", "", narrative.strip()]
+    lines = [f"# {title}", ""]
+    notice = machine_translation_notice_markdown(locale)
+    if notice is not None:
+        lines.extend([notice, ""])
+    lines.append(narrative.strip())
     if comparison is not None:
         lines.extend(["", render_comparison_table(comparison, locale=locale)])
     if reconciliation is not None:
         lines.extend(["", render_reconciliation_table(reconciliation, locale=locale)])
     if charts:
         lines.extend(["", render_charts_section(charts, chart_dir=chart_dir, locale=locale)])
+    if coverage is not None:
+        lines.extend(["", render_requirement_coverage(coverage, locale=locale)])
     if provenance is not None:
         lines.extend(["", provenance_markdown(provenance, locale=locale)])
     lines.extend(["", copy.receipts_heading, ""])
@@ -313,6 +374,7 @@ def receipts_manifest(
     *,
     provenance: Provenance | None = None,
     artifacts: Mapping[str, str] | None = None,
+    coverage: RequirementCoverage | None = None,
 ) -> str:
     """Render the receipts as a JSON manifest for machine verification.
 
@@ -330,6 +392,12 @@ def receipts_manifest(
     digest size, canonicalization rule set), so a consumer can validate and
     re-derive without reading the engine. See ``docs/schema/receipts.schema.json``
     and ADR 0005.
+
+    When ``coverage`` is given, the manifest carries the requirement coverage
+    record and the sha256 of the requirement document it was computed against, so
+    ``verify --bundle`` can detect the document being edited after export. The key
+    is absent entirely for a spec with no ``[requirements]`` binding, so such a
+    manifest is byte-identical to the one written before coverage existed.
 
     Every receipt carries ``suppressed``. When it is true the withheld numerics
     (``value``, ``row_count``, ``slice_hash``, ``column_names``) are ``null``,
@@ -372,6 +440,8 @@ def receipts_manifest(
     }
     if provenance is not None:
         payload["provenance"] = provenance_record(provenance)
+    if coverage is not None:
+        payload["requirements"] = coverage.payload()
     if artifacts is not None:
         payload["artifacts"] = dict(sorted(artifacts.items()))
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
@@ -398,6 +468,15 @@ def render_eval_markdown(report: EvalReport, *, dataset: str) -> str:
     # no-data case honestly instead of letting a vacuous rate stand in for one.
     grounding_rate_display = (
         _pct(report.grounding_rate) if report.n_numbers else "N/A (no numeric spans)"
+    )
+    # The row beneath it, over the same empty denominator. The hallucinated
+    # rate substitutes 0.0 rather than 1.0 (see evaluate.py), and 0.0 is the
+    # best possible value for it, so "0.0%" reads as a measured absence of
+    # invented numbers rather than as no measurement. The 95% CI printed beside
+    # it is already the widest honest [0.0%, 100.0%]; the point estimate has to
+    # agree with the interval next to it.
+    hallucinated_rate_display = (
+        _pct(report.hallucinated_rate) if report.n_numbers else "N/A (no numeric spans)"
     )
     gate_observed = (
         f"(observed {grounding_rate_display})."
@@ -477,7 +556,7 @@ def render_eval_markdown(report: EvalReport, *, dataset: str) -> str:
         f"| **Grounding rate (gated)** | **{grounding_rate_display}** "
         f"({report.n_bound}/{report.n_numbers}) | {_ci(report.grounding_ci)} |",
         f"| Unverifiable numbers | {report.n_unbound} | |",
-        f"| Hallucinated-number rate | {_pct(report.hallucinated_rate)} "
+        f"| Hallucinated-number rate | {hallucinated_rate_display} "
         f"({report.n_unbound}/{report.n_numbers}) | {_ci(report.hallucinated_ci)} |",
         "",
         "## Gate",

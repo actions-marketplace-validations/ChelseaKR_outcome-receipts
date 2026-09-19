@@ -58,6 +58,19 @@ both opt in. Small aggregate displays can reach the provider before publication
 suppression, so the adopting organization must authorize the transfer and review
 its Bedrock logging and retention configuration.
 
+`receipts mcp` adds a second surface where a model meets this tool, and it is
+not a cloud boundary: the transport is standard input and output on the
+operator's own machine, the server opens no socket, and every response is
+computed from the post-suppression figure set. What crosses it is whatever the
+assistant already holds — the operator's own draft, sent in, and a bound/unbound
+verdict sent back. A withheld cell is answerable only as the redaction marker
+with null numerics; the pre-suppression figures are consulted in one place, to
+*classify* a span as a disclosure, and no display or value from that set enters
+a response. Tool arguments carry the draft, so nothing narrative is logged: the
+error path names the method and the exception class only. The server exposes no
+tool that writes, exports, or records an approval, so it cannot stand in for the
+named human sign-off `run` requires.
+
 ### Minimization, suppression, retention, and recovery
 
 The application does not copy or persist source rows. Counts 1 through 10 are
@@ -119,7 +132,27 @@ are not inferred from automated results.
   remains tracked in issue 53. The 2026-07-22 waiver review confirmed that
   identifiers remain quoted, SQL values remain parameterized, mapping candidates
   remain unexecuted, and a no-suppression Semgrep 1.168.0 scan still reports the
-  obsolete Python 3.7 rule against this Python 3.12-only package.
+  obsolete Python 3.7 rule against this Python 3.12-only package. The 2026-08-28
+  review repeated both no-suppression scans: each rule still fires, so neither
+  waiver can be retired. `make hygiene` now also runs
+  `scripts/check_semgrep_waivers.py`, which compares `.semgrep-waivers.yml`
+  against `src/`, `tests/`, `scripts/` and `.github/` in both directions, so
+  within those four directories a ledger row cannot outlive the suppression it
+  documents and an undocumented suppression cannot be added. Before it, both of
+  those states passed every gate. The scan is those four directories and the
+  suffixes `.py`, `.mjs`, `.js`, `.sh`, `.yml`, `.yaml` and `.toml`, which is
+  narrower than `make security-semgrep`, which scans the whole repository: a
+  suppression added under `eval/`, `docs/`, `examples/` or at the repository
+  root is not seen by this check, and that gap is why the sentence names its
+  scope rather than claiming the tree. That check also holds the quarterly
+  cadence issues 52 and 53 commit to: a `last_reviewed` date more than 92 days
+  old fails the build naming its tracking issue, a date in the future is
+  refused, and a review date recorded here but not in the ledger — or in the
+  ledger but not here — is reported as the two records disagreeing. Until then
+  `last_reviewed` was parsed and discarded, so a waiver whose review had lapsed
+  by a year passed exactly like one reviewed yesterday, and this paragraph and
+  the ledger could describe two different reviews with nothing to notice. On the
+  2026-08-28 dates above, the next review is due **2026-11-28**.
 - VEX: N/A today because scans report no unfixable HIGH/CRITICAL dependency CVE.
   Any future exception requires a CycloneDX VEX and quarterly review.
 

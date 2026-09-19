@@ -10,13 +10,33 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Key pull requests on the ref and pushes on the commit.
+  #
+  # A concurrency group holds one running run and one pending run. A third run
+  # joining the group cancels the pending one before it dispatches a single job,
+  # so that commit ends `cancelled` with zero jobs and no verdict at all. Keyed
+  # only on `github.ref`, every push to the default branch shared one group with
+  # the merge before it, so a burst of merges lost the middle ones.
+  #
+  # Measured 2026-09-05 over the 100 most recent `ci` runs on `main`: 6 ended
+  # `cancelled`, every one of them with zero jobs dispatched — six commits that
+  # reached `main` without a single job being run against them. Four of `main`'s
+  # six required status checks — `verify`, `security`, `accessibility` and
+  # `dogfood-action` — are produced by this workflow, so a run lost here is four
+  # of the six going unmeasured on that commit.
+  #
+  # Keying pushes on the SHA gives every merge its own group, so pushes never
+  # contend. Pull requests keep the shared `-pr` key, so pushing again to a PR
+  # still cancels the previous, now-irrelevant run; `cancel-in-progress` is left
+  # exactly as it was, and is now unreachable for pushes.
+  group: ci-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   verify:
     name: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       # Actions are pinned to commit SHAs per the supply-chain standard; the
       # trailing comment names the tag the SHA corresponds to, for readability.
@@ -48,6 +68,7 @@ jobs:
     # this job (SEC-07). Renaming it requires updating the live ruleset first.
     name: security (pip-audit · osv-scanner · gitleaks · zizmor)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
         with:
@@ -56,10 +77,12 @@ jobs:
 
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
         with:
+          enable-cache: true
           version: "0.11.19"
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
         with:
+          cache: 'npm'
           node-version: "22"
       - name: Install and smoke-check the complete toolchain
         run: make install-smoke
@@ -75,12 +98,14 @@ jobs:
   accessibility:
     name: accessibility (pa11y, WCAG2AA, trace.html)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
         with:
+          enable-cache: true
           version: "0.11.19"
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
         with:
@@ -96,6 +121,7 @@ jobs:
   dogfood-action:
     name: dogfood-action
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -113,6 +139,7 @@ jobs:
   container:
     name: container (build · smoke · trivy)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
